@@ -171,8 +171,24 @@ ifHCOutOctets{ifAlias="",ifDescr="eth0",ifIndex="2",ifName="eth0"} 1000
 func formatMetrics(ifMetrics []ifMetric, hostname string, name string) []string {
 	var metrics []string
 	for _, metric := range ifMetrics {
-		metrics = append(metrics, fmt.Sprintf("ifHCInOctets{host=\"%s\",ifName=\"%s\",ifDescr=\"%s\",ifIndex=\"%s\",name=\"%s\"} %d", hostname, metric.ifname, metric.ifdescr, metric.ifIndex, metric.ifhcInOctets, name))
-		metrics = append(metrics, fmt.Sprintf("ifHCOutOctets{host=\"%s\",ifName=\"%s\",ifDescr=\"%s\",ifIndex=\"%s\",name=\"%s\"} %d", hostname, metric.ifname, metric.ifdescr, metric.ifIndex, metric.ifhcOutOctets, name))
+		metrics = append(metrics, fmt.Sprintf(
+			"ifHCInOctets{host=\"%s\",ifName=\"%s\",ifDescr=\"%s\",ifIndex=\"%s\",name=\"%s\"} %d",
+			hostname,
+			metric.ifname,
+			metric.ifdescr,
+			metric.ifIndex,
+			name,
+			metric.ifhcInOctets,
+		))
+		metrics = append(metrics, fmt.Sprintf(
+			"ifHCOutOctets{host=\"%s\",ifName=\"%s\",ifDescr=\"%s\",ifIndex=\"%s\",name=\"%s\"} %d",
+			hostname,
+			metric.ifname,
+			metric.ifdescr,
+			metric.ifIndex,
+			name,
+			metric.ifhcOutOctets,
+		))
 	}
 	// Add internal metrics
 	metrics = append(metrics, fmt.Sprintf("usnmp_requests{instance=\"%s\"} %d", *instance, Statrequests))
