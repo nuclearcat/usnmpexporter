@@ -5,13 +5,14 @@ SPDX-License-Identifier: LGPL-2.1-or-later
 usnmp_exporter is a simple snmp exporter for prometheus. It can be used to get interface metrics from a snmp device.
 It can be used in two ways:
 - by GET parameters: ip, community, version
-- by config file: usnmp_exporter.yml
+- by config file: usnmp_exporter.yml (will add also the snmp device name, to be used in the metrics)
 
 The config file should be in yaml format and should contain the snmp devices to get the metrics from.
 Example:
 - ip: 1.2.3.4
   community: secret
   version: 2c
+  name: myrouter
 
 
 */
@@ -57,6 +58,7 @@ type snmpDevice struct {
 	Ip        string `yaml:"ip"`
 	Community string `yaml:"community"`
 	Version   string `yaml:"version"`
+	Name      string `yaml:"name"`
 }
 
 const (
@@ -124,16 +126,16 @@ func getIfStr(goSnmp *gosnmp.GoSNMP, oid string) ([]myOids, error) {
 Final format should be similar to prometheus snmp_exporter
 ifHCOutOctets{ifAlias="",ifDescr="eth0",ifIndex="2",ifName="eth0"} 1000
 */
-func formatMetrics(ifMetrics []ifMetric, hostname string) []string {
+func formatMetrics(ifMetrics []ifMetric, hostname string, name string) []string {
 	var metrics []string
 	for _, metric := range ifMetrics {
-		metrics = append(metrics, fmt.Sprintf("ifHCInOctets{host=\"%s\",ifName=\"%s\",ifDescr=\"%s\",ifIndex=\"%s\"} %d", hostname, metric.ifname, metric.ifdescr, metric.ifIndex, metric.ifhcInOctets))
-		metrics = append(metrics, fmt.Sprintf("ifHCOutOctets{host=\"%s\",ifName=\"%s\",ifDescr=\"%s\",ifIndex=\"%s\"} %d", hostname, metric.ifname, metric.ifdescr, metric.ifIndex, metric.ifhcOutOctets))
+		metrics = append(metrics, fmt.Sprintf("ifHCInOctets{host=\"%s\",ifName=\"%s\",ifDescr=\"%s\",ifIndex=\"%s\",name=\"%s\"} %d", hostname, metric.ifname, metric.ifdescr, metric.ifIndex, metric.ifhcInOctets, name))
+		metrics = append(metrics, fmt.Sprintf("ifHCOutOctets{host=\"%s\",ifName=\"%s\",ifDescr=\"%s\",ifIndex=\"%s\",name=\"%s\"} %d", hostname, metric.ifname, metric.ifdescr, metric.ifIndex, metric.ifhcOutOctets, name))
 	}
 	return metrics
 }
 
-func snmpWalk(device string, community string, version string) ([]string, error) {
+func snmpWalk(device string, community string, version string, name string) ([]string, error) {
 	var ifMetricsTotal []ifMetric
 	var snmpVersion gosnmp.SnmpVersion
 
@@ -203,7 +205,7 @@ func snmpWalk(device string, community string, version string) ([]string, error)
 		log.Printf("Metrics for %s: %v\n", device, ifMetricsTotal)
 	}
 
-	return formatMetrics(ifMetricsTotal, device), nil
+	return formatMetrics(ifMetricsTotal, device, name), nil
 }
 
 // getMetrics gets the metrics from the snmp device
@@ -223,8 +225,13 @@ func getMetricsbyGET(r *http.Request) ([]string, error) {
 	if version == "" {
 		return nil, fmt.Errorf("no version specified")
 	}
+	// get name (alias name)
+	name := r.URL.Query().Get("name")
+	if name == "" {
+		name = device
+	}
 	// get the metrics from the snmp device
-	return snmpWalk(device, community, version)
+	return snmpWalk(device, community, version, name)
 }
 
 /* config sample:
@@ -269,7 +276,7 @@ func getMetricsbyCFG() ([]string, error) {
 		if *verbose {
 			log.Printf("Getting metrics for %s community %s version %s\n", device.Ip, device.Community, device.Version)
 		}
-		devmetric, err := snmpWalk(device.Ip, device.Community, device.Version)
+		devmetric, err := snmpWalk(device.Ip, device.Community, device.Version, device.Name)
 		if err != nil {
 			return nil, fmt.Errorf("error getting metrics: %s", err)
 		}
@@ -311,7 +318,7 @@ func metricsHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func main() {
-	log.Println("Starting usnmp_exporter v1.0 at ", *listenAddress)
+	log.Println("Starting usnmp_exporter v1.1 at ", *listenAddress)
 	flag.Parse()
 
 	// spin up the http server
