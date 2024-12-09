@@ -14,6 +14,8 @@ Example:
   version: 2c
   name: myrouter
 
+  TODO:
+  - ignore metrics retrieved with less than minperiod
 
 */
 
@@ -37,6 +39,15 @@ var (
 	listenAddress = flag.String("listen-address", ":9116", "Address on which to expose metrics and web interface.")
 	cfgFile       = flag.String("config", "usnmp_exporter.yml", "Path to configuration file.")
 	verbose       = flag.Bool("verbose", false, "Verbose output")
+	minperiod     = flag.Int("minperiod", 15, "Minimum period to get metrics from the snmp device")
+	instance      = flag.String("instance", "usnmp", "Instance name")
+)
+
+// internal metrics
+var (
+	Statrequests  = 0
+	Staterrors    = 0
+	lastDevUptime = make(map[string]uint64)
 )
 
 type ifMetric struct {
@@ -74,8 +85,10 @@ const (
 // getIfName gets the interface name from the snmp device
 func getIfName(goSnmp *gosnmp.GoSNMP, oid string) ([]ifMetric, error) {
 	var ifMetrics []ifMetric
+	Statrequests++
 	result, err := goSnmp.BulkWalkAll(oid)
 	if err != nil {
+		Staterrors++
 		return nil, fmt.Errorf("error getting metrics: %s", err)
 	}
 
@@ -93,8 +106,10 @@ func getIfName(goSnmp *gosnmp.GoSNMP, oid string) ([]ifMetric, error) {
 // getIfCtr gets the interface counter from the snmp device
 func getIfCtr(goSnmp *gosnmp.GoSNMP, oid string) ([]myOids, error) {
 	var ifMetrics []myOids
+	Statrequests++
 	result, err := goSnmp.BulkWalkAll(oid)
 	if err != nil {
+		Staterrors++
 		return nil, fmt.Errorf("error getting metrics: %s", err)
 	}
 
@@ -109,8 +124,10 @@ func getIfCtr(goSnmp *gosnmp.GoSNMP, oid string) ([]myOids, error) {
 // getIfStr gets the interface string from the snmp device
 func getIfStr(goSnmp *gosnmp.GoSNMP, oid string) ([]myOids, error) {
 	var ifMetrics []myOids
+	Statrequests++
 	result, err := goSnmp.BulkWalkAll(oid)
 	if err != nil {
+		Staterrors++
 		return nil, fmt.Errorf("error getting metrics: %s", err)
 	}
 
@@ -120,6 +137,31 @@ func getIfStr(goSnmp *gosnmp.GoSNMP, oid string) ([]myOids, error) {
 		ifMetrics = append(ifMetrics, myOids{oid, value, 0})
 	}
 	return ifMetrics, nil
+}
+
+// get system uptime to calculate the time difference
+func getSysUpTime(goSnmp *gosnmp.GoSNMP) (uint64, error) {
+	var sysUpTime uint64
+	Statrequests++
+	result, err := goSnmp.Get([]string{SysUpTimeOID})
+	if err != nil {
+		Staterrors++
+		return 0, fmt.Errorf("error getting metrics: %s", err)
+	}
+	// make sure we have the result
+	if len(result.Variables) == 0 {
+		Staterrors++
+		// emulate uptime by getting the current time
+		return uint64(time.Now().Unix()), nil
+	}
+	// prevent "interface conversion: interface {} is nil, not uint64"
+	if result.Variables[0].Value == nil {
+		Staterrors++
+		log.Printf("Error getting sysUpTime: Value is nil\n")
+		return uint64(time.Now().Unix()), nil
+	}
+	sysUpTime = result.Variables[0].Value.(uint64)
+	return sysUpTime, nil
 }
 
 /*
@@ -132,6 +174,10 @@ func formatMetrics(ifMetrics []ifMetric, hostname string, name string) []string 
 		metrics = append(metrics, fmt.Sprintf("ifHCInOctets{host=\"%s\",ifName=\"%s\",ifDescr=\"%s\",ifIndex=\"%s\",name=\"%s\"} %d", hostname, metric.ifname, metric.ifdescr, metric.ifIndex, metric.ifhcInOctets, name))
 		metrics = append(metrics, fmt.Sprintf("ifHCOutOctets{host=\"%s\",ifName=\"%s\",ifDescr=\"%s\",ifIndex=\"%s\",name=\"%s\"} %d", hostname, metric.ifname, metric.ifdescr, metric.ifIndex, metric.ifhcOutOctets, name))
 	}
+	// Add internal metrics
+	metrics = append(metrics, fmt.Sprintf("usnmp_requests{instance=\"%s\"} %d", *instance, Statrequests))
+	metrics = append(metrics, fmt.Sprintf("usnmp_errors{instance=\"%s\"} %d", *instance, Staterrors))
+
 	return metrics
 }
 
@@ -166,6 +212,14 @@ func snmpWalk(device string, community string, version string, name string) ([]s
 	defer params.Conn.Close()
 
 	// TODO(nuclearcat): maybe we can do this in one go?
+
+	// retrieve uptime
+	sysUpTime, err := getSysUpTime(params)
+	// check if diff is less than minperiod
+	if lastDevUptime[device] != 0 && sysUpTime-lastDevUptime[device] < uint64(*minperiod) {
+		return nil, fmt.Errorf("device %s uptime less than %d seconds", device, *minperiod)
+	}
+	lastDevUptime[device] = sysUpTime
 
 	ifMetricsTotal, err = getIfName(params, ifName)
 	if err != nil {
