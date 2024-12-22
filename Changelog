@@ -1,5 +1,9 @@
 usnmpexporter changelog
 
+v1.2.0 (2024-12-22)
+
+- Add first packet notification to confirm SNMP operational
+
 v1.1 (2024-12-09)
 
 - Add field name
