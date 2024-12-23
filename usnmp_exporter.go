@@ -353,7 +353,7 @@ func pingDevice(ip string) bool {
 	var remoteAddr *net.IPAddr
 	var timeout time.Duration
 	// resolve the ip
-	r, err := net.ResolveIPAddr("ip", ip)
+	r, err := net.ResolveIPAddr("ip4", ip)
 	if err != nil {
 		log.Printf("Error resolving ip: %s\n", err)
 		return false
@@ -363,7 +363,7 @@ func pingDevice(ip string) bool {
 		log.Printf("Pinging device: %s\n", remoteAddr)
 	}
 
-	pinger, err = ping.New("", "")
+	pinger, err = ping.New("0.0.0.0", "")
 	if err != nil {
 		log.Printf("Error creating pinger: %s\n", err)
 		return false

@@ -1,5 +1,10 @@
 usnmpexporter changelog
 
+v1.2.1 (2024-12-23)
+
+- Ping SNMP agent before start to collect data, to not start if agent is down
+- TODO: Add tests after build
+
 v1.2.0 (2024-12-22)
 
 - Add first packet notification to confirm SNMP operational
