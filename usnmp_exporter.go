@@ -50,6 +50,7 @@ var (
 // internal metrics
 var (
 	Statrequests  = 0
+	Statanswers   = 0
 	Staterrors    = 0
 	lastDevUptime = make(map[string]uint64)
 )
@@ -94,7 +95,16 @@ func getIfName(goSnmp *gosnmp.GoSNMP, oid string) ([]ifMetric, error) {
 	if err != nil {
 		Staterrors++
 		return nil, fmt.Errorf("error getting metrics: %s", err)
+	} else if len(result) == 0 {
+		Staterrors++
+		return nil, fmt.Errorf("no metrics found")
+	} else if *verbose {
+		log.Printf("getIfName: %v\n", result)
 	}
+	if Statanswers == 0 {
+		log.Printf("First answer: %v\n", result)
+	}
+	Statanswers++
 
 	// our oid base is 1.3.6.1.2.1.31.1.1.1.1. , after that interface index
 	for _, variable := range result {
