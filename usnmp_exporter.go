@@ -25,12 +25,16 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"time"
 
 	"github.com/gosnmp/gosnmp" // https://github.com/gosnmp/gosnmp
 	"gopkg.in/yaml.v2"         //
+
+	// ping library:
+	ping "github.com/digineo/go-ping"
 )
 
 var (
@@ -333,6 +337,44 @@ func loadConfig(cfgFile string) ([]snmpDevice, error) {
 	return snmpDevices, nil
 }
 
+// pingDevice pings the device to check if it is reachable
+func pingDevice(ip string) bool {
+	var pinger *ping.Pinger
+	var remoteAddr *net.IPAddr
+	var timeout time.Duration
+	// resolve the ip
+	r, err := net.ResolveIPAddr("ip", ip)
+	if err != nil {
+		log.Printf("Error resolving ip: %s\n", err)
+		return false
+	}
+	remoteAddr = r
+	if *verbose {
+		log.Printf("Pinging device: %s\n", remoteAddr)
+	}
+
+	pinger, err = ping.New("", "")
+	if err != nil {
+		log.Printf("Error creating pinger: %s\n", err)
+		return false
+	}
+	defer pinger.Close()
+
+	// set the timeout
+	timeout = 2 * time.Second
+	rtt, err := pinger.PingAttempts(remoteAddr, timeout, 1)
+	if err != nil {
+		log.Printf("Error pinging device: %s\n", err)
+		return false
+	}
+
+	if *verbose {
+		log.Printf("Ping rtt: %s\n", rtt)
+	}
+
+	return true
+}
+
 // getMetricsCFG gets the metrics from the snmp devices in the config file
 func getMetricsbyCFG() ([]string, error) {
 	metrics := []string{}
@@ -342,6 +384,14 @@ func getMetricsbyCFG() ([]string, error) {
 		return nil, fmt.Errorf("error loading config file: %s", err)
 	}
 	for _, device := range snmpDevices {
+		// ping the device
+		if !pingDevice(device.Ip) {
+			if *verbose {
+				log.Printf("Error pinging device: %s\n", device.Ip)
+			}
+			continue
+		}
+
 		// get the metrics from the snmp device
 		if *verbose {
 			log.Printf("Getting metrics for %s community %s version %s\n", device.Ip, device.Community, device.Version)

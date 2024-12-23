@@ -1,3 +1,4 @@
-- ip: 10.1.1.1
+- name: router
+  ip: 10.1.1.1
   community: public
   version: 2c
