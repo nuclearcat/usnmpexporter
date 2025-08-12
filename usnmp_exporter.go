@@ -13,6 +13,14 @@ Example:
   community: secret
   version: 2c
 
+  TODO:
+  - ignore metrics retrieved with less than minperiod
+  - investigate 4x rate reporting discrepancy (possible causes):
+    * Counter resets/wraparounds
+    * Unit confusion (bits vs bytes)
+    * Prometheus rate() function behavior with counter resets
+    * Bundle interface specific behavior in Cisco XR
+    * Sampling interval timing issues
 
 */
 
@@ -24,6 +32,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/gosnmp/gosnmp" // https://github.com/gosnmp/gosnmp
@@ -36,6 +45,16 @@ var (
 	listenAddress = flag.String("listen-address", ":9116", "Address on which to expose metrics and web interface.")
 	cfgFile       = flag.String("config", "usnmp_exporter.yml", "Path to configuration file.")
 	verbose       = flag.Bool("verbose", false, "Verbose output")
+	minperiod     = flag.Int("minperiod", 15, "Minimum period to get metrics from the snmp device")
+	instance      = flag.String("instance", "usnmp", "Instance name")
+)
+
+// internal metrics
+var (
+	Statrequests  = 0
+	Staterrors    = 0
+	lastDevUptime = make(map[string]uint64)
+	lastCounters  = make(map[string]map[string]uint64) // deviceIP -> interfaceName -> lastValue
 )
 
 type ifMetric struct {
@@ -49,6 +68,7 @@ type ifMetric struct {
 
 type myOids struct {
 	oid      string
+	ifIndex  string // interface index extracted from the OID
 	valueStr string
 	valueInt uint64
 }
@@ -59,6 +79,7 @@ type snmpDevice struct {
 	Version   string `yaml:"version"`
 }
 
+// 1.3.6.1.2.1.31.1.1.1.6.35
 const (
 	IfDescrOID       = "1.3.6.1.2.1.2.2.1.2"
 	ifName           = "1.3.6.1.2.1.31.1.1.1.1"
@@ -66,14 +87,33 @@ const (
 	IfHCOutUcastPkts = "1.3.6.1.2.1.31.1.1.1.11"
 	IfHCInOctets     = "1.3.6.1.2.1.31.1.1.1.6"
 	IfHCOutOctets    = "1.3.6.1.2.1.31.1.1.1.10"
+	IfHighSpeed      = "1.3.6.1.2.1.31.1.1.1.15" // Interface speed in Mbps
+	IfSpeed          = "1.3.6.1.2.1.2.2.1.5"     // Interface speed in bps (for legacy)
 	SysUpTimeOID     = "1.3.6.1.2.1.1.3"
 )
+
+// If we have 1.2.3.4.5.6 oid, then interface index is 6
+func getIfIdxOid(oid string) (string, error) {
+	// Check if the OID is valid
+	if oid == "" {
+		return "", fmt.Errorf("empty OID provided")
+	}
+	// split by dots
+	oidParts := strings.Split(oid, ".")
+	if len(oidParts) < 2 {
+		return "", fmt.Errorf("invalid OID format: %s", oid)
+	}
+	ifIndex := oidParts[len(oidParts)-1]
+	return ifIndex, nil
+}
 
 // getIfName gets the interface name from the snmp device
 func getIfName(goSnmp *gosnmp.GoSNMP, oid string) ([]ifMetric, error) {
 	var ifMetrics []ifMetric
+	Statrequests++
 	result, err := goSnmp.BulkWalkAll(oid)
 	if err != nil {
+		Staterrors++
 		return nil, fmt.Errorf("error getting metrics: %s", err)
 	}
 
@@ -81,7 +121,11 @@ func getIfName(goSnmp *gosnmp.GoSNMP, oid string) ([]ifMetric, error) {
 	for _, variable := range result {
 		oid := variable.Name
 		// get the interface index
-		ifIndex := oid[len(ifName):]
+		ifIndex, err := getIfIdxOid(oid)
+		if err != nil {
+			log.Printf("Warning: Could not get interface index for %s: %v", oid, err)
+			continue
+		}
 		valueStr := string(variable.Value.([]uint8))
 		ifMetrics = append(ifMetrics, ifMetric{valueStr, ifIndex, "", 0, 0, 0})
 	}
@@ -91,15 +135,41 @@ func getIfName(goSnmp *gosnmp.GoSNMP, oid string) ([]ifMetric, error) {
 // getIfCtr gets the interface counter from the snmp device
 func getIfCtr(goSnmp *gosnmp.GoSNMP, oid string) ([]myOids, error) {
 	var ifMetrics []myOids
+	Statrequests++
 	result, err := goSnmp.BulkWalkAll(oid)
 	if err != nil {
+		Staterrors++
 		return nil, fmt.Errorf("error getting metrics: %s", err)
 	}
 
 	for _, variable := range result {
 		oid := variable.Name
-		value := variable.Value.(uint64)
-		ifMetrics = append(ifMetrics, myOids{oid, "", value})
+		var value uint64
+
+		// Handle different integer types that SNMP might return
+		switch v := variable.Value.(type) {
+		case uint64:
+			value = v
+		case uint32:
+			value = uint64(v)
+		case uint:
+			value = uint64(v)
+		case int64:
+			value = uint64(v)
+		case int32:
+			value = uint64(v)
+		case int:
+			value = uint64(v)
+		default:
+			log.Printf("Warning: Unexpected type %T for OID %s, value: %v", variable.Value, oid, variable.Value)
+			value = 0
+		}
+		ifIdx, err := getIfIdxOid(oid)
+		if err != nil {
+			log.Printf("Warning: Could not get interface index for %s: %v", oid, err)
+			continue
+		}
+		ifMetrics = append(ifMetrics, myOids{oid, ifIdx, "", value})
 	}
 	return ifMetrics, nil
 }
@@ -107,17 +177,95 @@ func getIfCtr(goSnmp *gosnmp.GoSNMP, oid string) ([]myOids, error) {
 // getIfStr gets the interface string from the snmp device
 func getIfStr(goSnmp *gosnmp.GoSNMP, oid string) ([]myOids, error) {
 	var ifMetrics []myOids
+	Statrequests++
 	result, err := goSnmp.BulkWalkAll(oid)
 	if err != nil {
+		Staterrors++
 		return nil, fmt.Errorf("error getting metrics: %s", err)
 	}
 
 	for _, variable := range result {
 		oid := variable.Name
+		ifIdx, err := getIfIdxOid(oid)
+		if err != nil {
+			log.Printf("Warning: Could not get interface index for %s: %v", oid, err)
+			continue
+		}
 		value := string(variable.Value.([]uint8))
-		ifMetrics = append(ifMetrics, myOids{oid, value, 0})
+		ifMetrics = append(ifMetrics, myOids{oid, ifIdx, value, 0})
 	}
 	return ifMetrics, nil
+}
+
+// detectCounterReset checks if a counter has reset and logs it
+func detectCounterReset(device, ifname string, inOctets, outOctets uint64) {
+	if lastCounters[device] == nil {
+		lastCounters[device] = make(map[string]uint64)
+	}
+
+	inKey := ifname + "_in"
+	outKey := ifname + "_out"
+
+	if lastIn, exists := lastCounters[device][inKey]; exists {
+		if inOctets < lastIn {
+			log.Printf("COUNTER RESET detected: %s %s InOctets: %d < %d (diff: %d)",
+				device, ifname, inOctets, lastIn, lastIn-inOctets)
+		}
+	}
+
+	if lastOut, exists := lastCounters[device][outKey]; exists {
+		if outOctets < lastOut {
+			log.Printf("COUNTER RESET detected: %s %s OutOctets: %d < %d (diff: %d)",
+				device, ifname, outOctets, lastOut, lastOut-outOctets)
+		}
+	}
+
+	lastCounters[device][inKey] = inOctets
+	lastCounters[device][outKey] = outOctets
+}
+
+// get system uptime to calculate the time difference
+func getSysUpTime(goSnmp *gosnmp.GoSNMP) (uint64, error) {
+	var sysUpTime uint64
+	Statrequests++
+	result, err := goSnmp.Get([]string{SysUpTimeOID})
+	if err != nil {
+		Staterrors++
+		return 0, fmt.Errorf("error getting metrics: %s", err)
+	}
+	// make sure we have the result
+	if len(result.Variables) == 0 {
+		Staterrors++
+		// emulate uptime by getting the current time
+		return uint64(time.Now().Unix()), nil
+	}
+	// prevent "interface conversion: interface {} is nil, not uint64"
+	if result.Variables[0].Value == nil {
+		Staterrors++
+		log.Printf("Error getting sysUpTime: Value is nil\n")
+		return uint64(time.Now().Unix()), nil
+	}
+
+	// Handle different integer types that SNMP might return for sysUpTime
+	switch v := result.Variables[0].Value.(type) {
+	case uint64:
+		sysUpTime = v
+	case uint32:
+		sysUpTime = uint64(v)
+	case uint:
+		sysUpTime = uint64(v)
+	case int64:
+		sysUpTime = uint64(v)
+	case int32:
+		sysUpTime = uint64(v)
+	case int:
+		sysUpTime = uint64(v)
+	default:
+		log.Printf("Warning: Unexpected type %T for sysUpTime, value: %v", result.Variables[0].Value, result.Variables[0].Value)
+		return uint64(time.Now().Unix()), nil
+	}
+
+	return sysUpTime, nil
 }
 
 /*
@@ -127,10 +275,34 @@ ifHCOutOctets{ifAlias="",ifDescr="eth0",ifIndex="2",ifName="eth0"} 1000
 func formatMetrics(ifMetrics []ifMetric, hostname string) []string {
 	var metrics []string
 	for _, metric := range ifMetrics {
+		//log.Printf("DEBUG: Metric for %s: %s %s %d %d", metric.ifname, metric.ifdescr, metric.ifIndex, metric.ifhcInOctets, metric.ifhcOutOctets)
 		metrics = append(metrics, fmt.Sprintf("ifHCInOctets{host=\"%s\",ifName=\"%s\",ifDescr=\"%s\",ifIndex=\"%s\"} %d", hostname, metric.ifname, metric.ifdescr, metric.ifIndex, metric.ifhcInOctets))
 		metrics = append(metrics, fmt.Sprintf("ifHCOutOctets{host=\"%s\",ifName=\"%s\",ifDescr=\"%s\",ifIndex=\"%s\"} %d", hostname, metric.ifname, metric.ifdescr, metric.ifIndex, metric.ifhcOutOctets))
+		// Add interface speed in bps (convert from Mbps)
 	}
+	// Add internal metrics
+	metrics = append(metrics, fmt.Sprintf("usnmp_requests{instance=\"%s\"} %d", *instance, Statrequests))
+	metrics = append(metrics, fmt.Sprintf("usnmp_errors{instance=\"%s\"} %d", *instance, Staterrors))
+
 	return metrics
+}
+
+func getByIfIndexStr(ifIndex string, metrics []myOids) string {
+	for _, metric := range metrics {
+		if metric.ifIndex == ifIndex {
+			return metric.valueStr
+		}
+	}
+	return ""
+}
+
+func getByIfIndexInt(ifIndex string, metrics []myOids) uint64 {
+	for _, metric := range metrics {
+		if metric.ifIndex == ifIndex {
+			return metric.valueInt
+		}
+	}
+	return 0
 }
 
 func snmpWalk(device string, community string, version string) ([]string, error) {
@@ -165,6 +337,17 @@ func snmpWalk(device string, community string, version string) ([]string, error)
 
 	// TODO(nuclearcat): maybe we can do this in one go?
 
+	// retrieve uptime
+	sysUpTime, err := getSysUpTime(params)
+	if err != nil && *verbose {
+		log.Printf("Warning: Could not get sysUpTime for %s: %v", device, err)
+	}
+	// check if diff is less than minperiod
+	if lastDevUptime[device] != 0 && sysUpTime-lastDevUptime[device] < uint64(*minperiod) {
+		return nil, fmt.Errorf("device %s uptime less than %d seconds", device, *minperiod)
+	}
+	lastDevUptime[device] = sysUpTime
+
 	ifMetricsTotal, err = getIfName(params, ifName)
 	if err != nil {
 		return nil, fmt.Errorf("error getting metrics: %s", err)
@@ -181,26 +364,48 @@ func snmpWalk(device string, community string, version string) ([]string, error)
 	if err != nil {
 		return nil, fmt.Errorf("error getting metrics: %s", err)
 	}
+	/*
+		// Useless, it is just interface speed
+		ifMetricsSpeed, err := getIfCtr(params, IfHighSpeed)
+		if err != nil && *verbose {
+			log.Printf("Warning: Could not get interface speeds for %s: %v", device, err)
+		}
+	*/
 
-	// verify if other metrics are available and have the same length
-	totLen := len(ifMetricsTotal)
-	descrLen := len(ifMetricsDescr)
-	inOctetsLen := len(ifMetricsInOctets)
-	outOctetsLen := len(ifMetricsOutOctets)
-	if totLen != descrLen || totLen != inOctetsLen || totLen != outOctetsLen {
-		return nil, fmt.Errorf("error getting metrics: different length of metrics")
-	}
+	/*
+		speedLen := 0
+		if ifMetricsSpeed != nil {
+			speedLen = len(ifMetricsSpeed)
+		}
+	*/
+	//if totLen != descrLen || totLen != inOctetsLen || totLen != outOctetsLen {
+	//	return nil, fmt.Errorf("error getting metrics: different length of metrics")
+	//}
 
 	// merge the metrics
 	for i := range ifMetricsTotal {
-		ifMetricsTotal[i].ifdescr = ifMetricsDescr[i].valueStr
-		ifMetricsTotal[i].ifhcInOctets = ifMetricsInOctets[i].valueInt
-		ifMetricsTotal[i].ifhcOutOctets = ifMetricsOutOctets[i].valueInt
+		ifIdx := ifMetricsTotal[i].ifIndex
+		// we need to fill ifhcInOctets, ifhcOutOctets, ifDescr
+		ifMetricsTotal[i].ifhcInOctets = getByIfIndexInt(ifIdx, ifMetricsInOctets)
+		ifMetricsTotal[i].ifhcOutOctets = getByIfIndexInt(ifIdx, ifMetricsOutOctets)
+		ifMetricsTotal[i].ifdescr = getByIfIndexStr(ifIdx, ifMetricsDescr)
+
+		/*
+			if speedLen > i {
+				ifMetricsTotal[i].ifHighSpeed = ifMetricsSpeed[i].valueInt
+			} else {
+				ifMetricsTotal[i].ifHighSpeed = 0
+			}
+		*/
 		ifMetricsTotal[i].timeStamp = time.Now().Unix()
 	}
 
 	if *verbose {
-		log.Printf("Metrics for %s: %v\n", device, ifMetricsTotal)
+		//log.Printf("Metrics for %s: %v\n", device, ifMetricsTotal)
+		// Detect counter resets for all interfaces
+		for _, metric := range ifMetricsTotal {
+			detectCounterReset(device, metric.ifname, metric.ifhcInOctets, metric.ifhcOutOctets)
+		}
 	}
 
 	return formatMetrics(ifMetricsTotal, device), nil
