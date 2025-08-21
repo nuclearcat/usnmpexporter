@@ -63,6 +63,8 @@ type ifMetric struct {
 	ifdescr       string
 	ifhcInOctets  uint64
 	ifhcOutOctets uint64
+	ifMiscCtr     []uint64
+	ifMiscName    []string
 	timeStamp     int64
 }
 
@@ -73,10 +75,34 @@ type myOids struct {
 	valueInt uint64
 }
 
+/*
+Additional counters polled, related to interfaces
+For example: ifInBroadcastPkts
+BaseOID: .1.3.6.1.2.1.31.1.1.1.3
+Name: ifInBroadcastPkts
+*/
+type ifMiscOID struct {
+	BaseOID string `yaml:"BaseOID"`
+	Name    string `yaml:"Name"`
+}
+
+type KV struct {
+	Key   string `yaml:"key"`   // Key for the tag
+	Value string `yaml:"value"` // Value for the tag
+}
+
+type oidMisc struct {
+	OID  string `yaml:"oid"`  // OID to poll
+	Name string `yaml:"name"` // Name of the OID
+	Tags []KV   `yaml:"tags"` // Tags for the OID
+}
+
 type snmpDevice struct {
-	Ip        string `yaml:"ip"`
-	Community string `yaml:"community"`
-	Version   string `yaml:"version"`
+	Ip        string      `yaml:"ip"`
+	Community string      `yaml:"community"`
+	Version   string      `yaml:"version"`
+	IFMisc    []ifMiscOID `yaml:"ifmisc"`  // Additional interface counters
+	OIDMisc   []oidMisc   `yaml:"oidmisc"` // Additional OIDs
 }
 
 // 1.3.6.1.2.1.31.1.1.1.6.35
@@ -127,9 +153,42 @@ func getIfName(goSnmp *gosnmp.GoSNMP, oid string) ([]ifMetric, error) {
 			continue
 		}
 		valueStr := string(variable.Value.([]uint8))
-		ifMetrics = append(ifMetrics, ifMetric{valueStr, ifIndex, "", 0, 0, 0})
+		ifMetrics = append(ifMetrics, ifMetric{valueStr, ifIndex, "", 0, 0, nil, nil, 0})
 	}
 	return ifMetrics, nil
+}
+
+func getOIDUint64(goSnmp *gosnmp.GoSNMP, oid string) (uint64, error) {
+	Statrequests++
+	result, err := goSnmp.Get([]string{oid})
+	if err != nil {
+		Staterrors++
+		return 0, fmt.Errorf("error getting metrics: %s", err)
+	}
+	if len(result.Variables) == 0 {
+		Staterrors++
+		return 0, fmt.Errorf("no result for OID: %s", oid)
+	}
+	// Handle different integer types that SNMP might return
+	var value uint64
+	switch v := result.Variables[0].Value.(type) {
+	case uint64:
+		value = v
+	case uint32:
+		value = uint64(v)
+	case uint:
+		value = uint64(v)
+	case int64:
+		value = uint64(v)
+	case int32:
+		value = uint64(v)
+	case int:
+		value = uint64(v)
+	default:
+		Staterrors++
+		return 0, fmt.Errorf("unexpected type for OID %s: %T", oid, result.Variables[0].Value)
+	}
+	return value, nil
 }
 
 // getIfCtr gets the interface counter from the snmp device
@@ -278,7 +337,11 @@ func formatMetrics(ifMetrics []ifMetric, hostname string) []string {
 		//log.Printf("DEBUG: Metric for %s: %s %s %d %d", metric.ifname, metric.ifdescr, metric.ifIndex, metric.ifhcInOctets, metric.ifhcOutOctets)
 		metrics = append(metrics, fmt.Sprintf("ifHCInOctets{host=\"%s\",ifName=\"%s\",ifDescr=\"%s\",ifIndex=\"%s\"} %d", hostname, metric.ifname, metric.ifdescr, metric.ifIndex, metric.ifhcInOctets))
 		metrics = append(metrics, fmt.Sprintf("ifHCOutOctets{host=\"%s\",ifName=\"%s\",ifDescr=\"%s\",ifIndex=\"%s\"} %d", hostname, metric.ifname, metric.ifdescr, metric.ifIndex, metric.ifhcOutOctets))
-		// Add interface speed in bps (convert from Mbps)
+		// Also add misc metrics from config
+		nummusc := len(metric.ifMiscCtr)
+		for i := 0; i < nummusc; i++ {
+			metrics = append(metrics, fmt.Sprintf("%s{host=\"%s\",ifName=\"%s\",ifDescr=\"%s\",ifIndex=\"%s\"} %d", metric.ifMiscName[i], hostname, metric.ifname, metric.ifdescr, metric.ifIndex, metric.ifMiscCtr[i]))
+		}
 	}
 	// Add internal metrics
 	metrics = append(metrics, fmt.Sprintf("usnmp_requests{instance=\"%s\"} %d", *instance, Statrequests))
@@ -305,9 +368,19 @@ func getByIfIndexInt(ifIndex string, metrics []myOids) uint64 {
 	return 0
 }
 
-func snmpWalk(device string, community string, version string) ([]string, error) {
+// func snmpWalk(device string, community string, version string, ifMisc []ifMiscOID) ([]string, error) {
+func snmpWalk(snmpdev snmpDevice) ([]string, error) {
+	device := snmpdev.Ip
+	community := snmpdev.Community
+	version := snmpdev.Version
+	ifMisc := snmpdev.IFMisc
+	oidMisc := snmpdev.OIDMisc
+
 	var ifMetricsTotal []ifMetric
 	var snmpVersion gosnmp.SnmpVersion
+	// uint64 map by interface index
+	var miscMyOIDs [][]myOids
+	var miscName []string
 
 	switch version {
 	case "1":
@@ -352,6 +425,7 @@ func snmpWalk(device string, community string, version string) ([]string, error)
 	if err != nil {
 		return nil, fmt.Errorf("error getting metrics: %s", err)
 	}
+
 	ifMetricsDescr, err := getIfStr(params, IfDescrOID)
 	if err != nil {
 		return nil, fmt.Errorf("error getting metrics: %s", err)
@@ -364,12 +438,40 @@ func snmpWalk(device string, community string, version string) ([]string, error)
 	if err != nil {
 		return nil, fmt.Errorf("error getting metrics: %s", err)
 	}
-	/*
-		// Useless, it is just interface speed
-		ifMetricsSpeed, err := getIfCtr(params, IfHighSpeed)
-		if err != nil && *verbose {
-			log.Printf("Warning: Could not get interface speeds for %s: %v", device, err)
+
+	// get misc as getIfCtr
+	if ifMisc != nil {
+		miscnum := len(ifMisc)
+		if miscnum > 0 {
+			// first fill myOIDs
+			miscMyOIDs = make([][]myOids, miscnum)
+			miscName = make([]string, miscnum)
+			for i := 0; i < miscnum; i++ {
+				miscName[i] = ifMisc[i].Name
+				miscMyOIDs[i], err = getIfCtr(params, ifMisc[i].BaseOID)
+				if err != nil {
+					return nil, fmt.Errorf("error getting metrics: %s", err)
+				}
+			}
 		}
+	}
+
+	/*
+			// Useless, it is just interface speed
+					ifMetricsMisc, err := getIfCtr(params, ifMisc[i].BaseOID)
+					if err != nil {
+						return nil, fmt.Errorf("error getting metrics: %s", err)
+					}
+				}
+			}
+		}
+
+		/*
+			// Useless, it is just interface speed
+			ifMetricsSpeed, err := getIfCtr(params, IfHighSpeed)
+			if err != nil && *verbose {
+				log.Printf("Warning: Could not get interface speeds for %s: %v", device, err)
+			}
 	*/
 
 	/*
@@ -389,6 +491,14 @@ func snmpWalk(device string, community string, version string) ([]string, error)
 		ifMetricsTotal[i].ifhcInOctets = getByIfIndexInt(ifIdx, ifMetricsInOctets)
 		ifMetricsTotal[i].ifhcOutOctets = getByIfIndexInt(ifIdx, ifMetricsOutOctets)
 		ifMetricsTotal[i].ifdescr = getByIfIndexStr(ifIdx, ifMetricsDescr)
+		if len(miscMyOIDs) > i {
+			// append one by one to ifMetricsTotal[i].ifMiscCtrs , ifMetricsTotal[i].ifMiscNames
+			for j := range miscMyOIDs[i] {
+				ctr := getByIfIndexInt(ifIdx, miscMyOIDs[j])
+				ifMetricsTotal[i].ifMiscCtr = append(ifMetricsTotal[i].ifMiscCtr, ctr)
+				ifMetricsTotal[i].ifMiscName = append(ifMetricsTotal[i].ifMiscName, miscName[i])
+			}
+		}
 
 		/*
 			if speedLen > i {
@@ -408,9 +518,28 @@ func snmpWalk(device string, community string, version string) ([]string, error)
 		}
 	}
 
-	return formatMetrics(ifMetricsTotal, device), nil
+	mymetrics := formatMetrics(ifMetricsTotal, device)
+	// now process oid
+	for _, oid := range oidMisc {
+		name := oid.Name
+		value, err := getOIDUint64(params, oid.OID)
+		if err != nil {
+			return nil, fmt.Errorf("error getting metrics: %s", err)
+		}
+		tags := ""
+		for _, tag := range oid.Tags {
+			tags += fmt.Sprintf(",%s=\"%s\"", tag.Key, tag.Value)
+		}
+		if value != 0 {
+			metric := fmt.Sprintf("%s{host=\"%s\"%s} %d", name, device, tags, value)
+			mymetrics = append(mymetrics, metric)
+		}
+	}
+
+	return mymetrics, nil
 }
 
+/*
 // getMetrics gets the metrics from the snmp device
 func getMetricsbyGET(r *http.Request) ([]string, error) {
 	// device is set as GET parameter IP
@@ -429,8 +558,9 @@ func getMetricsbyGET(r *http.Request) ([]string, error) {
 		return nil, fmt.Errorf("no version specified")
 	}
 	// get the metrics from the snmp device
-	return snmpWalk(device, community, version)
+	return snmpWalk(
 }
+*/
 
 /* config sample:
 - ip:
@@ -474,7 +604,7 @@ func getMetricsbyCFG() ([]string, error) {
 		if *verbose {
 			log.Printf("Getting metrics for %s community %s version %s\n", device.Ip, device.Community, device.Version)
 		}
-		devmetric, err := snmpWalk(device.Ip, device.Community, device.Version)
+		devmetric, err := snmpWalk(device)
 		if err != nil {
 			return nil, fmt.Errorf("error getting metrics: %s", err)
 		}
@@ -502,11 +632,13 @@ func metricsHandler(w http.ResponseWriter, r *http.Request) {
 			log.Printf("Using GET parameters for request %s\n", r.URL)
 		}
 		// get the metrics from the snmp device set over GET request params
-		metrics, err = getMetricsbyGET(r)
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
+		//metrics, err = getMetricsbyGET(r)
+		//if err != nil {
+		//	http.Error(w, err.Error(), http.StatusInternalServerError)
+		//	return
+		//}
+		http.Error(w, "GET parameters are not supported yet, please use config file", http.StatusNotImplemented)
+		return
 	}
 
 	// write the metrics to the http response
