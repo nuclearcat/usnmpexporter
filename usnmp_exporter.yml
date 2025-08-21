@@ -12,3 +12,63 @@
       Name: ifOutDiscards
     - BaseOID: .1.3.6.1.2.1.2.2.1.20
       Name: ifOutErrors
+  oifmisc:
+    - oid: 1.3.6.1.4.1.6527.3.1.2.3.54.1.43.2.4
+      name: vRtrIfRxBytes
+      tags:
+        - key: "interface"
+          value: "eth0"
+        - key: "customer"
+          value: "abouali"
+        - key: "vprn"
+          value: "moon"
+    - oid: 1.3.6.1.4.1.6527.3.1.2.3.74.1.4.2.4
+      name: vRtrIfTxBytes
+      tags:
+        - key: "interface"
+          value: "eth0"
+        - key: "customer"
+          value: "abouali"
+        - key: "vprn"
+          value: "moon"
+    - oid: 1.3.6.1.4.1.6527.3.1.2.3.54.1.43.3.3
+      name: vRtrIfRxBytes
+      tags:
+        - key: "interface"
+          value: "eth12"
+        - key: "customer"
+          value: "lamborghini"
+        - key: "vprn"
+          value: "mars"
+    - oid: 1.3.6.1.4.1.6527.3.1.2.3.74.1.4.3.3
+      name: vRtrIfTxBytes
+      tags:
+        - key: "interface"
+          value: "eth12"
+        - key: "customer"
+          value: "lamborghini"
+        - key: "vprn"
+          value: "mars"
+    - oid: 1.3.6.1.4.1.6527.3.1.2.3.54.1.43.2.3
+      name: vRtrIfRxBytes
+      tags:
+        - key: "interface"
+          value: "eth2"
+        - key: "customer"
+          value: "shimano"
+        - key: "vprn"
+          value: "moon"
+    - oid: 1.3.6.1.4.1.6527.3.1.2.3.74.1.4.2.3
+      name: vRtrIfTxBytes
+      tags:
+        - key: "interface"
+          value: "eth2"
+        - key: "customer"
+          value: "shimano"
+        - key: "vprn"
+          value: "moon"
+    - oid: 1.3.6.1.4.1.6527.3.1.2.1.1.1
+      name: sgiCpuUsage
+      tags:
+        - key: "kind"
+          value: "controlplane"
