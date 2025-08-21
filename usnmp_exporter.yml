@@ -1,3 +1,21 @@
+# id@router> show snmp mib walk 1 | match Temperature
+# jnxDomCurrentModuleTemperature.558 = 27
+# id@router> show snmp mib walk jnxDomCurrentModuleTemperature | display xml
+# ...
+#        <snmp-object>
+#            <name>jnxDomCurrentModuleTemperature.510</name>
+#            <index>
+#                <index-name>ifIndex</index-name>
+#                <index-value>510</index-value>
+#            </index>
+#            <object-value-type>number</object-value-type>
+#            <object-value>0</object-value>
+#            <oid>1.3.6.1.4.1.2636.3.60.1.1.1.1.8.510</oid>
+#
+# ifmisc:
+#   - BaseOID: .1.3.6.1.4.1.2636.3.60.1.1.1.1.8
+#     Name: jnxDomCurrentModuleTemperature
+
 - ip: 10.1.1.1
   community: public
   version: 2c
@@ -12,8 +30,10 @@
       Name: ifOutDiscards
     - BaseOID: .1.3.6.1.2.1.2.2.1.20
       Name: ifOutErrors
-  oifmisc:
-    - oid: 1.3.6.1.4.1.6527.3.1.2.3.54.1.43.2.4
+    - BaseOID: .1.3.6.1.4.1.2636.3.60.1.1.1.1.8
+      Name: jnxDomCurrentModuleTemperature
+  oidmisc:
+    - oid: .1.3.6.1.4.1.6527.3.1.2.3.54.1.43.2.4
       name: vRtrIfRxBytes
       tags:
         - key: "interface"
@@ -22,7 +42,7 @@
           value: "abouali"
         - key: "vprn"
           value: "moon"
-    - oid: 1.3.6.1.4.1.6527.3.1.2.3.74.1.4.2.4
+    - oid: .1.3.6.1.4.1.6527.3.1.2.3.74.1.4.2.4
       name: vRtrIfTxBytes
       tags:
         - key: "interface"
@@ -31,7 +51,7 @@
           value: "abouali"
         - key: "vprn"
           value: "moon"
-    - oid: 1.3.6.1.4.1.6527.3.1.2.3.54.1.43.3.3
+    - oid: .1.3.6.1.4.1.6527.3.1.2.3.54.1.43.3.3
       name: vRtrIfRxBytes
       tags:
         - key: "interface"
@@ -40,7 +60,7 @@
           value: "lamborghini"
         - key: "vprn"
           value: "mars"
-    - oid: 1.3.6.1.4.1.6527.3.1.2.3.74.1.4.3.3
+    - oid: .1.3.6.1.4.1.6527.3.1.2.3.74.1.4.3.3
       name: vRtrIfTxBytes
       tags:
         - key: "interface"
@@ -49,7 +69,7 @@
           value: "lamborghini"
         - key: "vprn"
           value: "mars"
-    - oid: 1.3.6.1.4.1.6527.3.1.2.3.54.1.43.2.3
+    - oid: .1.3.6.1.4.1.6527.3.1.2.3.54.1.43.2.3
       name: vRtrIfRxBytes
       tags:
         - key: "interface"
@@ -58,7 +78,7 @@
           value: "shimano"
         - key: "vprn"
           value: "moon"
-    - oid: 1.3.6.1.4.1.6527.3.1.2.3.74.1.4.2.3
+    - oid: .1.3.6.1.4.1.6527.3.1.2.3.74.1.4.2.3
       name: vRtrIfTxBytes
       tags:
         - key: "interface"
@@ -67,7 +87,7 @@
           value: "shimano"
         - key: "vprn"
           value: "moon"
-    - oid: 1.3.6.1.4.1.6527.3.1.2.1.1.1
+    - oid: .1.3.6.1.4.1.6527.3.1.2.1.1.1
       name: sgiCpuUsage
       tags:
         - key: "kind"
