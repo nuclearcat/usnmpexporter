@@ -113,8 +113,6 @@ const (
 	IfHCOutUcastPkts = "1.3.6.1.2.1.31.1.1.1.11"
 	IfHCInOctets     = "1.3.6.1.2.1.31.1.1.1.6"
 	IfHCOutOctets    = "1.3.6.1.2.1.31.1.1.1.10"
-	IfHighSpeed      = "1.3.6.1.2.1.31.1.1.1.15" // Interface speed in Mbps
-	IfSpeed          = "1.3.6.1.2.1.2.2.1.5"     // Interface speed in bps (for legacy)
 	SysUpTimeOID     = "1.3.6.1.2.1.1.3"
 )
 
@@ -456,34 +454,6 @@ func snmpWalk(snmpdev snmpDevice) ([]string, error) {
 		}
 	}
 
-	/*
-			// Useless, it is just interface speed
-					ifMetricsMisc, err := getIfCtr(params, ifMisc[i].BaseOID)
-					if err != nil {
-						return nil, fmt.Errorf("error getting metrics: %s", err)
-					}
-				}
-			}
-		}
-
-		/*
-			// Useless, it is just interface speed
-			ifMetricsSpeed, err := getIfCtr(params, IfHighSpeed)
-			if err != nil && *verbose {
-				log.Printf("Warning: Could not get interface speeds for %s: %v", device, err)
-			}
-	*/
-
-	/*
-		speedLen := 0
-		if ifMetricsSpeed != nil {
-			speedLen = len(ifMetricsSpeed)
-		}
-	*/
-	//if totLen != descrLen || totLen != inOctetsLen || totLen != outOctetsLen {
-	//	return nil, fmt.Errorf("error getting metrics: different length of metrics")
-	//}
-
 	// merge the metrics
 	for i := range ifMetricsTotal {
 		ifIdx := ifMetricsTotal[i].ifIndex
@@ -500,13 +470,6 @@ func snmpWalk(snmpdev snmpDevice) ([]string, error) {
 			}
 		}
 
-		/*
-			if speedLen > i {
-				ifMetricsTotal[i].ifHighSpeed = ifMetricsSpeed[i].valueInt
-			} else {
-				ifMetricsTotal[i].ifHighSpeed = 0
-			}
-		*/
 		ifMetricsTotal[i].timeStamp = time.Now().Unix()
 	}
 
