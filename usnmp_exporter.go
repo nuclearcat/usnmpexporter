@@ -51,10 +51,11 @@ var (
 
 // internal metrics
 var (
-	Statrequests  = 0
-	Staterrors    = 0
-	lastDevUptime = make(map[string]uint64)
-	lastCounters  = make(map[string]map[string]uint64) // deviceIP -> interfaceName -> lastValue
+	Statrequests    = 0
+	Staterrors      = 0
+	lastDevUptime   = make(map[string]uint64)
+	lastCounters    = make(map[string]map[string]uint64) // deviceIP -> interfaceName -> lastValue
+	warned32BitOnly = make(map[string]bool)              // deviceIP -> warned about 32-bit counters
 )
 
 type ifMetric struct {
@@ -107,13 +108,19 @@ type snmpDevice struct {
 
 // 1.3.6.1.2.1.31.1.1.1.6.35
 const (
-	IfDescrOID       = "1.3.6.1.2.1.2.2.1.2"
+	// Basic ifTable (RFC 1213) - 32-bit counters
+	IfDescrOID  = "1.3.6.1.2.1.2.2.1.2"
+	IfInOctets  = "1.3.6.1.2.1.2.2.1.10"
+	IfOutOctets = "1.3.6.1.2.1.2.2.1.16"
+
+	// ifXTable extension (RFC 2863) - 64-bit HC counters
 	ifName           = "1.3.6.1.2.1.31.1.1.1.1"
 	IfHCInUcastPkts  = "1.3.6.1.2.1.31.1.1.1.7"
 	IfHCOutUcastPkts = "1.3.6.1.2.1.31.1.1.1.11"
 	IfHCInOctets     = "1.3.6.1.2.1.31.1.1.1.6"
 	IfHCOutOctets    = "1.3.6.1.2.1.31.1.1.1.10"
-	SysUpTimeOID     = "1.3.6.1.2.1.1.3"
+
+	SysUpTimeOID = "1.3.6.1.2.1.1.3"
 )
 
 // If we have 1.2.3.4.5.6 oid, then interface index is 6
@@ -299,7 +306,7 @@ func getSysUpTime(goSnmp *gosnmp.GoSNMP) (uint64, error) {
 	// prevent "interface conversion: interface {} is nil, not uint64"
 	if result.Variables[0].Value == nil {
 		Staterrors++
-		log.Printf("Error getting sysUpTime: Value is nil\n")
+		log.Printf("Warning: getting sysUpTime: Value is nil\n")
 		return uint64(time.Now().Unix()), nil
 	}
 
@@ -419,22 +426,45 @@ func snmpWalk(snmpdev snmpDevice) ([]string, error) {
 	}
 	lastDevUptime[device] = sysUpTime
 
-	ifMetricsTotal, err = getIfName(params, ifName)
-	if err != nil {
-		return nil, fmt.Errorf("error getting metrics: %s", err)
-	}
-
+	// Use ifDescr as primary source for interface discovery (more universal, especially on Nokia SROS)
 	ifMetricsDescr, err := getIfStr(params, IfDescrOID)
 	if err != nil {
 		return nil, fmt.Errorf("error getting metrics: %s", err)
 	}
+
+	// Build initial interface list from ifDescr
+	for _, metric := range ifMetricsDescr {
+		ifMetricsTotal = append(ifMetricsTotal, ifMetric{
+			ifname:  metric.valueStr, // Use ifDescr as default name
+			ifIndex: metric.ifIndex,
+			ifdescr: metric.valueStr,
+		})
+	}
+
+	// Try to get ifName (IF-MIB extension) - use as better interface name if available
+	ifMetricsName, err := getIfStr(params, ifName)
+	if err != nil && *verbose {
+		log.Printf("Warning: Could not get ifName for %s (will use ifDescr): %v", device, err)
+	}
+
+	// Try HC (64-bit) counters first from ifXTable
 	ifMetricsInOctets, err := getIfCtr(params, IfHCInOctets)
-	if err != nil {
-		return nil, fmt.Errorf("error getting metrics: %s", err)
+	if err != nil && *verbose {
+		log.Printf("Warning: Could not get HC InOctets for %s, will try basic counters: %v", device, err)
 	}
 	ifMetricsOutOctets, err := getIfCtr(params, IfHCOutOctets)
-	if err != nil {
-		return nil, fmt.Errorf("error getting metrics: %s", err)
+	if err != nil && *verbose {
+		log.Printf("Warning: Could not get HC OutOctets for %s, will try basic counters: %v", device, err)
+	}
+
+	// Get basic 32-bit counters from ifTable as fallback
+	ifMetricsInOctetsBasic, err := getIfCtr(params, IfInOctets)
+	if err != nil && *verbose {
+		log.Printf("Warning: Could not get basic InOctets for %s: %v", device, err)
+	}
+	ifMetricsOutOctetsBasic, err := getIfCtr(params, IfOutOctets)
+	if err != nil && *verbose {
+		log.Printf("Warning: Could not get basic OutOctets for %s: %v", device, err)
 	}
 
 	// get misc as getIfCtr
@@ -455,22 +485,50 @@ func snmpWalk(snmpdev snmpDevice) ([]string, error) {
 	}
 
 	// merge the metrics
+	usedBasicCounters := false
 	for i := range ifMetricsTotal {
 		ifIdx := ifMetricsTotal[i].ifIndex
-		// we need to fill ifhcInOctets, ifhcOutOctets, ifDescr
-		ifMetricsTotal[i].ifhcInOctets = getByIfIndexInt(ifIdx, ifMetricsInOctets)
-		ifMetricsTotal[i].ifhcOutOctets = getByIfIndexInt(ifIdx, ifMetricsOutOctets)
-		ifMetricsTotal[i].ifdescr = getByIfIndexStr(ifIdx, ifMetricsDescr)
-		if len(miscMyOIDs) > i {
+		// Try to use ifName if available, otherwise keep ifDescr as the interface name
+		if ifName := getByIfIndexStr(ifIdx, ifMetricsName); ifName != "" {
+			ifMetricsTotal[i].ifname = ifName
+		}
+		// Fill counters - try HC (64-bit) first, fallback to basic (32-bit) if not available
+		inOctets := getByIfIndexInt(ifIdx, ifMetricsInOctets)
+		outOctets := getByIfIndexInt(ifIdx, ifMetricsOutOctets)
+
+		// If HC counters are 0, try basic counters as fallback
+		if inOctets == 0 {
+			inOctets = getByIfIndexInt(ifIdx, ifMetricsInOctetsBasic)
+			if inOctets > 0 {
+				usedBasicCounters = true
+			}
+		}
+		if outOctets == 0 {
+			outOctets = getByIfIndexInt(ifIdx, ifMetricsOutOctetsBasic)
+			if outOctets > 0 {
+				usedBasicCounters = true
+			}
+		}
+
+		ifMetricsTotal[i].ifhcInOctets = inOctets
+		ifMetricsTotal[i].ifhcOutOctets = outOctets
+		// Note: ifdescr is already set from ifMetricsDescr during initialization
+		if len(miscMyOIDs) > 0 {
 			// append one by one to ifMetricsTotal[i].ifMiscCtrs , ifMetricsTotal[i].ifMiscNames
-			for j := range miscMyOIDs[i] {
+			for j := range miscMyOIDs {
 				ctr := getByIfIndexInt(ifIdx, miscMyOIDs[j])
 				ifMetricsTotal[i].ifMiscCtr = append(ifMetricsTotal[i].ifMiscCtr, ctr)
-				ifMetricsTotal[i].ifMiscName = append(ifMetricsTotal[i].ifMiscName, miscName[i])
+				ifMetricsTotal[i].ifMiscName = append(ifMetricsTotal[i].ifMiscName, miscName[j])
 			}
 		}
 
 		ifMetricsTotal[i].timeStamp = time.Now().Unix()
+	}
+
+	// Warn once per device if using 32-bit counters (may wrap at 4GB)
+	if usedBasicCounters && !warned32BitOnly[device] {
+		log.Printf("Warning: Device %s does not support 64-bit HC counters for some interfaces, using 32-bit counters (may wrap at 4GB)", device)
+		warned32BitOnly[device] = true
 	}
 
 	if *verbose {
@@ -587,6 +645,7 @@ func metricsHandler(w http.ResponseWriter, r *http.Request) {
 		// get the metrics from the snmp devices in the config file
 		metrics, err = getMetricsbyCFG()
 		if err != nil {
+			log.Printf("Error getting metrics: %s\n", err)
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
@@ -608,10 +667,15 @@ func metricsHandler(w http.ResponseWriter, r *http.Request) {
 	for _, metric := range metrics {
 		fmt.Fprintf(w, "%s\n", metric)
 	}
+	// verbose
+	if *verbose {
+		metricslen := len(metrics)
+		log.Printf("Metrics for request %s (%d total)\n", r.URL, metricslen)
+	}
 }
 
 func main() {
-	log.Println("Starting usnmp_exporter v1.0 at ", *listenAddress)
+	log.Println("Starting usnmp_exporter v1.1 at ", *listenAddress)
 	flag.Parse()
 
 	// spin up the http server
@@ -621,5 +685,7 @@ func main() {
 		log.Printf("Not found: %s\n", r.URL)
 		http.NotFound(w, r)
 	})
+	log.Printf("Listening on %s\n", *listenAddress)
 	log.Fatal(http.ListenAndServe(*listenAddress, nil))
+
 }
