@@ -108,6 +108,7 @@ type snmpDevice struct {
 	Version   string      `yaml:"version"`
 	IFMisc    []ifMiscOID `yaml:"ifmisc"`  // Additional interface counters
 	OIDMisc   []oidMisc   `yaml:"oidmisc"` // Additional OIDs
+	Tags      []KV        `yaml:"tags"`    // Tags applied to all metrics for the device
 }
 
 type uptimeTooShortError struct {
@@ -323,6 +324,17 @@ func sanitizeLabel(s string) string {
 	return strings.ReplaceAll(s, "\"", "_")
 }
 
+func renderTags(tags []KV) string {
+	if len(tags) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	for _, tag := range tags {
+		b.WriteString(fmt.Sprintf(",%s=\"%s\"", tag.Key, sanitizeLabel(tag.Value)))
+	}
+	return b.String()
+}
+
 // get system uptime to calculate the time difference
 func getSysUpTime(goSnmp *gosnmp.GoSNMP) (uint64, error) {
 	var sysUpTime uint64
@@ -371,16 +383,17 @@ func getSysUpTime(goSnmp *gosnmp.GoSNMP) (uint64, error) {
 Final format should be similar to prometheus snmp_exporter
 ifHCOutOctets{ifAlias="",ifDescr="eth0",ifIndex="2",ifName="eth0"} 1000
 */
-func formatMetrics(ifMetrics []ifMetric, hostname string) []string {
+func formatMetrics(ifMetrics []ifMetric, hostname string, tags []KV) []string {
 	var metrics []string
+	tagStr := renderTags(tags)
 	for _, metric := range ifMetrics {
 		//log.Printf("DEBUG: Metric for %s: %s %s %d %d", metric.ifname, metric.ifdescr, metric.ifIndex, metric.ifhcInOctets, metric.ifhcOutOctets)
-		metrics = append(metrics, fmt.Sprintf("ifHCInOctets{host=\"%s\",ifName=\"%s\",ifDescr=\"%s\",ifIndex=\"%s\"} %d", hostname, metric.ifname, metric.ifdescr, metric.ifIndex, metric.ifhcInOctets))
-		metrics = append(metrics, fmt.Sprintf("ifHCOutOctets{host=\"%s\",ifName=\"%s\",ifDescr=\"%s\",ifIndex=\"%s\"} %d", hostname, metric.ifname, metric.ifdescr, metric.ifIndex, metric.ifhcOutOctets))
+		metrics = append(metrics, fmt.Sprintf("ifHCInOctets{host=\"%s\",ifName=\"%s\",ifDescr=\"%s\",ifIndex=\"%s\"%s} %d", hostname, metric.ifname, metric.ifdescr, metric.ifIndex, tagStr, metric.ifhcInOctets))
+		metrics = append(metrics, fmt.Sprintf("ifHCOutOctets{host=\"%s\",ifName=\"%s\",ifDescr=\"%s\",ifIndex=\"%s\"%s} %d", hostname, metric.ifname, metric.ifdescr, metric.ifIndex, tagStr, metric.ifhcOutOctets))
 		// Also add misc metrics from config
 		nummusc := len(metric.ifMiscCtr)
 		for i := 0; i < nummusc; i++ {
-			metrics = append(metrics, fmt.Sprintf("%s{host=\"%s\",ifName=\"%s\",ifDescr=\"%s\",ifIndex=\"%s\"} %d", metric.ifMiscName[i], hostname, metric.ifname, metric.ifdescr, metric.ifIndex, metric.ifMiscCtr[i]))
+			metrics = append(metrics, fmt.Sprintf("%s{host=\"%s\",ifName=\"%s\",ifDescr=\"%s\",ifIndex=\"%s\"%s} %d", metric.ifMiscName[i], hostname, metric.ifname, metric.ifdescr, metric.ifIndex, tagStr, metric.ifMiscCtr[i]))
 		}
 	}
 	return metrics
@@ -411,6 +424,7 @@ func snmpWalk(snmpdev snmpDevice) ([]string, error) {
 	version := snmpdev.Version
 	ifMisc := snmpdev.IFMisc
 	oidMisc := snmpdev.OIDMisc
+	deviceTags := snmpdev.Tags
 
 	var ifMetricsTotal []ifMetric
 	var snmpVersion gosnmp.SnmpVersion
@@ -578,7 +592,7 @@ func snmpWalk(snmpdev snmpDevice) ([]string, error) {
 		}
 	}
 
-	mymetrics := formatMetrics(ifMetricsTotal, device)
+	mymetrics := formatMetrics(ifMetricsTotal, device, deviceTags)
 	// now process oid
 	for _, oid := range oidMisc {
 		name := oid.Name
@@ -587,10 +601,7 @@ func snmpWalk(snmpdev snmpDevice) ([]string, error) {
 			log.Printf("Warning: Could not get OID %s for %s: %v", oid.OID, device, err)
 			continue
 		}
-		tags := ""
-		for _, tag := range oid.Tags {
-			tags += fmt.Sprintf(",%s=\"%s\"", tag.Key, tag.Value)
-		}
+		tags := renderTags(deviceTags) + renderTags(oid.Tags)
 		if value != 0 {
 			metric := fmt.Sprintf("%s{host=\"%s\"%s} %d", name, device, tags, value)
 			mymetrics = append(mymetrics, metric)
@@ -758,7 +769,7 @@ func metricsHandler(w http.ResponseWriter, r *http.Request) {
 	// Add internal metrics once per scrape.
 	metrics = append(metrics, fmt.Sprintf("usnmp_requests{instance=\"%s\"} %d", *instance, loadRequests()))
 	metrics = append(metrics, fmt.Sprintf("usnmp_errors{instance=\"%s\"} %d", *instance, loadErrors()))
-	metrics = append(metrics, fmt.Sprintf("usnmp_scrape_duration_seconds{instance=\"%s\"} %.6f", *instance, time.Since(start).Seconds()))
+	metrics = append(metrics, fmt.Sprintf("usnmp_exporter_scrape_duration_seconds{instance=\"%s\"} %.6f", *instance, time.Since(start).Seconds()))
 
 	// write the metrics to the http response
 	for _, metric := range metrics {

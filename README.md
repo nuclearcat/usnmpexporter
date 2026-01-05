@@ -23,3 +23,6 @@ Replace `<community>` and `<device_ip>` with your SNMP community and device IP a
 
 This should give you a list of interface names, similar to what the exporter would get. You can do the same for the other OIDs to debug any issues.
 
+## Custom tags
+
+You can add tags per device in the YAML config and they will be applied to all metrics for that device, including `if*` and `oidmisc` metrics.
