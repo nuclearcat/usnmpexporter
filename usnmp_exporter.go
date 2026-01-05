@@ -28,11 +28,14 @@ package main
 
 import (
 	"flag"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
 	"os"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gosnmp/gosnmp" // https://github.com/gosnmp/gosnmp
@@ -51,11 +54,12 @@ var (
 
 // internal metrics
 var (
-	Statrequests    = 0
-	Staterrors      = 0
+	Statrequests    int64
+	Staterrors      int64
 	lastDevUptime   = make(map[string]uint64)
 	lastCounters    = make(map[string]map[string]uint64) // deviceIP -> interfaceName -> lastValue
 	warned32BitOnly = make(map[string]bool)              // deviceIP -> warned about 32-bit counters
+	stateMu         sync.Mutex
 )
 
 type ifMetric struct {
@@ -106,6 +110,15 @@ type snmpDevice struct {
 	OIDMisc   []oidMisc   `yaml:"oidmisc"` // Additional OIDs
 }
 
+type uptimeTooShortError struct {
+	device    string
+	minperiod int
+}
+
+func (e *uptimeTooShortError) Error() string {
+	return fmt.Sprintf("device %s uptime less than %d seconds", e.device, e.minperiod)
+}
+
 // 1.3.6.1.2.1.31.1.1.1.6.35
 const (
 	// Basic ifTable (RFC 1213) - 32-bit counters
@@ -141,10 +154,10 @@ func getIfIdxOid(oid string) (string, error) {
 // getIfName gets the interface name from the snmp device
 func getIfName(goSnmp *gosnmp.GoSNMP, oid string) ([]ifMetric, error) {
 	var ifMetrics []ifMetric
-	Statrequests++
+	incRequests()
 	result, err := goSnmp.BulkWalkAll(oid)
 	if err != nil {
-		Staterrors++
+		incErrors()
 		return nil, fmt.Errorf("error getting metrics: %s", err)
 	}
 
@@ -164,19 +177,34 @@ func getIfName(goSnmp *gosnmp.GoSNMP, oid string) ([]ifMetric, error) {
 }
 
 func getOIDUint64(goSnmp *gosnmp.GoSNMP, oid string) (uint64, error) {
-	Statrequests++
+	incRequests()
 	result, err := goSnmp.Get([]string{oid})
 	if err != nil {
-		Staterrors++
+		incErrors()
 		return 0, fmt.Errorf("error getting metrics: %s", err)
 	}
 	if len(result.Variables) == 0 {
-		Staterrors++
+		incErrors()
 		return 0, fmt.Errorf("no result for OID: %s", oid)
+	}
+	pdu := result.Variables[0]
+	if pdu.Type == gosnmp.NoSuchObject || pdu.Type == gosnmp.NoSuchInstance || pdu.Type == gosnmp.EndOfMibView {
+		incErrors()
+		if *verbose {
+			log.Printf("Warning: OID %s returned %v", oid, pdu.Type)
+		}
+		return 0, nil
+	}
+	if pdu.Value == nil {
+		incErrors()
+		if *verbose {
+			log.Printf("Warning: OID %s returned nil value", oid)
+		}
+		return 0, nil
 	}
 	// Handle different integer types that SNMP might return
 	var value uint64
-	switch v := result.Variables[0].Value.(type) {
+	switch v := pdu.Value.(type) {
 	case uint64:
 		value = v
 	case uint32:
@@ -190,8 +218,8 @@ func getOIDUint64(goSnmp *gosnmp.GoSNMP, oid string) (uint64, error) {
 	case int:
 		value = uint64(v)
 	default:
-		Staterrors++
-		return 0, fmt.Errorf("unexpected type for OID %s: %T", oid, result.Variables[0].Value)
+		incErrors()
+		return 0, fmt.Errorf("unexpected type for OID %s: %T", oid, pdu.Value)
 	}
 	return value, nil
 }
@@ -199,10 +227,10 @@ func getOIDUint64(goSnmp *gosnmp.GoSNMP, oid string) (uint64, error) {
 // getIfCtr gets the interface counter from the snmp device
 func getIfCtr(goSnmp *gosnmp.GoSNMP, oid string) ([]myOids, error) {
 	var ifMetrics []myOids
-	Statrequests++
+	incRequests()
 	result, err := goSnmp.BulkWalkAll(oid)
 	if err != nil {
-		Staterrors++
+		incErrors()
 		return nil, fmt.Errorf("error getting metrics: %s", err)
 	}
 
@@ -241,10 +269,10 @@ func getIfCtr(goSnmp *gosnmp.GoSNMP, oid string) ([]myOids, error) {
 // getIfStr gets the interface string from the snmp device
 func getIfStr(goSnmp *gosnmp.GoSNMP, oid string) ([]myOids, error) {
 	var ifMetrics []myOids
-	Statrequests++
+	incRequests()
 	result, err := goSnmp.BulkWalkAll(oid)
 	if err != nil {
-		Staterrors++
+		incErrors()
 		return nil, fmt.Errorf("error getting metrics: %s", err)
 	}
 
@@ -263,6 +291,8 @@ func getIfStr(goSnmp *gosnmp.GoSNMP, oid string) ([]myOids, error) {
 
 // detectCounterReset checks if a counter has reset and logs it
 func detectCounterReset(device, ifname string, inOctets, outOctets uint64) {
+	stateMu.Lock()
+	defer stateMu.Unlock()
 	if lastCounters[device] == nil {
 		lastCounters[device] = make(map[string]uint64)
 	}
@@ -288,24 +318,29 @@ func detectCounterReset(device, ifname string, inOctets, outOctets uint64) {
 	lastCounters[device][outKey] = outOctets
 }
 
+// sanitizeLabel sanitizes a string for use in Prometheus labels by replacing quotes with underscores
+func sanitizeLabel(s string) string {
+	return strings.ReplaceAll(s, "\"", "_")
+}
+
 // get system uptime to calculate the time difference
 func getSysUpTime(goSnmp *gosnmp.GoSNMP) (uint64, error) {
 	var sysUpTime uint64
-	Statrequests++
+	incRequests()
 	result, err := goSnmp.Get([]string{SysUpTimeOID})
 	if err != nil {
-		Staterrors++
+		incErrors()
 		return 0, fmt.Errorf("error getting metrics: %s", err)
 	}
 	// make sure we have the result
 	if len(result.Variables) == 0 {
-		Staterrors++
+		incErrors()
 		// emulate uptime by getting the current time
 		return uint64(time.Now().Unix()), nil
 	}
 	// prevent "interface conversion: interface {} is nil, not uint64"
 	if result.Variables[0].Value == nil {
-		Staterrors++
+		incErrors()
 		log.Printf("Warning: getting sysUpTime: Value is nil\n")
 		return uint64(time.Now().Unix()), nil
 	}
@@ -348,10 +383,6 @@ func formatMetrics(ifMetrics []ifMetric, hostname string) []string {
 			metrics = append(metrics, fmt.Sprintf("%s{host=\"%s\",ifName=\"%s\",ifDescr=\"%s\",ifIndex=\"%s\"} %d", metric.ifMiscName[i], hostname, metric.ifname, metric.ifdescr, metric.ifIndex, metric.ifMiscCtr[i]))
 		}
 	}
-	// Add internal metrics
-	metrics = append(metrics, fmt.Sprintf("usnmp_requests{instance=\"%s\"} %d", *instance, Statrequests))
-	metrics = append(metrics, fmt.Sprintf("usnmp_errors{instance=\"%s\"} %d", *instance, Staterrors))
-
 	return metrics
 }
 
@@ -421,10 +452,14 @@ func snmpWalk(snmpdev snmpDevice) ([]string, error) {
 		log.Printf("Warning: Could not get sysUpTime for %s: %v", device, err)
 	}
 	// check if diff is less than minperiod
-	if lastDevUptime[device] != 0 && sysUpTime-lastDevUptime[device] < uint64(*minperiod) {
-		return nil, fmt.Errorf("device %s uptime less than %d seconds", device, *minperiod)
+	stateMu.Lock()
+	lastUp := lastDevUptime[device]
+	if lastUp != 0 && sysUpTime-lastUp < uint64(*minperiod) {
+		stateMu.Unlock()
+		return nil, &uptimeTooShortError{device: device, minperiod: *minperiod}
 	}
 	lastDevUptime[device] = sysUpTime
+	stateMu.Unlock()
 
 	// Use ifDescr as primary source for interface discovery (more universal, especially on Nokia SROS)
 	ifMetricsDescr, err := getIfStr(params, IfDescrOID)
@@ -435,9 +470,9 @@ func snmpWalk(snmpdev snmpDevice) ([]string, error) {
 	// Build initial interface list from ifDescr
 	for _, metric := range ifMetricsDescr {
 		ifMetricsTotal = append(ifMetricsTotal, ifMetric{
-			ifname:  metric.valueStr, // Use ifDescr as default name
+			ifname:  sanitizeLabel(metric.valueStr), // Use ifDescr as default name
 			ifIndex: metric.ifIndex,
-			ifdescr: metric.valueStr,
+			ifdescr: sanitizeLabel(metric.valueStr),
 		})
 	}
 
@@ -490,7 +525,7 @@ func snmpWalk(snmpdev snmpDevice) ([]string, error) {
 		ifIdx := ifMetricsTotal[i].ifIndex
 		// Try to use ifName if available, otherwise keep ifDescr as the interface name
 		if ifName := getByIfIndexStr(ifIdx, ifMetricsName); ifName != "" {
-			ifMetricsTotal[i].ifname = ifName
+			ifMetricsTotal[i].ifname = sanitizeLabel(ifName)
 		}
 		// Fill counters - try HC (64-bit) first, fallback to basic (32-bit) if not available
 		inOctets := getByIfIndexInt(ifIdx, ifMetricsInOctets)
@@ -526,9 +561,13 @@ func snmpWalk(snmpdev snmpDevice) ([]string, error) {
 	}
 
 	// Warn once per device if using 32-bit counters (may wrap at 4GB)
-	if usedBasicCounters && !warned32BitOnly[device] {
-		log.Printf("Warning: Device %s does not support 64-bit HC counters for some interfaces, using 32-bit counters (may wrap at 4GB)", device)
-		warned32BitOnly[device] = true
+	if usedBasicCounters {
+		stateMu.Lock()
+		if !warned32BitOnly[device] {
+			log.Printf("Warning: Device %s does not support 64-bit HC counters for some interfaces, using 32-bit counters (may wrap at 4GB)", device)
+			warned32BitOnly[device] = true
+		}
+		stateMu.Unlock()
 	}
 
 	if *verbose {
@@ -545,7 +584,8 @@ func snmpWalk(snmpdev snmpDevice) ([]string, error) {
 		name := oid.Name
 		value, err := getOIDUint64(params, oid.OID)
 		if err != nil {
-			return nil, fmt.Errorf("error getting metrics: %s", err)
+			log.Printf("Warning: Could not get OID %s for %s: %v", oid.OID, device, err)
+			continue
 		}
 		tags := ""
 		for _, tag := range oid.Tags {
@@ -606,7 +646,7 @@ func loadConfig(cfgFile string) ([]snmpDevice, error) {
 	}
 	if *verbose {
 		for _, device := range snmpDevices {
-			log.Printf("Config file: %s %s %s\n", device.Ip, device.Community, device.Version)
+			log.Printf("Config file: %s %s\n", device.Ip, device.Version)
 		}
 	}
 	return snmpDevices, nil
@@ -620,22 +660,71 @@ func getMetricsbyCFG() ([]string, error) {
 	if err != nil {
 		return nil, fmt.Errorf("error loading config file: %s", err)
 	}
+	var (
+		wg        sync.WaitGroup
+		metricsMu sync.Mutex
+		errMu     sync.Mutex
+		firstErr  error
+	)
 	for _, device := range snmpDevices {
-		// get the metrics from the snmp device
-		if *verbose {
-			log.Printf("Getting metrics for %s community %s version %s\n", device.Ip, device.Community, device.Version)
+		dev := device
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if *verbose {
+				log.Printf("Getting metrics for %s version %s\n", dev.Ip, dev.Version)
+			}
+			start := time.Now()
+			devmetric, err := snmpWalk(dev)
+			elapsed := time.Since(start)
+			if err != nil {
+				var ute *uptimeTooShortError
+				if errors.As(err, &ute) {
+					log.Printf("Skipping device %s: %s\n", ute.device, ute.Error())
+					return
+				}
+				log.Printf("Device %s failed after %s\n", dev.Ip, elapsed)
+				errMu.Lock()
+				if firstErr == nil {
+					firstErr = err
+				}
+				errMu.Unlock()
+				return
+			}
+			log.Printf("Device %s: %d metrics in %s\n", dev.Ip, len(devmetric), elapsed)
+			metricsMu.Lock()
+			metrics = append(metrics, devmetric...)
+			metricsMu.Unlock()
+		}()
+	}
+	wg.Wait()
+	if firstErr != nil {
+		if len(metrics) == 0 {
+			return nil, fmt.Errorf("error getting metrics: %s", firstErr)
 		}
-		devmetric, err := snmpWalk(device)
-		if err != nil {
-			return nil, fmt.Errorf("error getting metrics: %s", err)
-		}
-		// append the metrics to the metrics slice
-		metrics = append(metrics, devmetric...)
+		return metrics, firstErr
 	}
 	return metrics, nil
 }
 
+func incRequests() {
+	atomic.AddInt64(&Statrequests, 1)
+}
+
+func incErrors() {
+	atomic.AddInt64(&Staterrors, 1)
+}
+
+func loadRequests() int64 {
+	return atomic.LoadInt64(&Statrequests)
+}
+
+func loadErrors() int64 {
+	return atomic.LoadInt64(&Staterrors)
+}
+
 func metricsHandler(w http.ResponseWriter, r *http.Request) {
+	start := time.Now()
 	metrics := []string{}
 	// is cfgFile existing?
 	if _, err := os.Stat(*cfgFile); err == nil {
@@ -644,10 +733,13 @@ func metricsHandler(w http.ResponseWriter, r *http.Request) {
 		}
 		// get the metrics from the snmp devices in the config file
 		metrics, err = getMetricsbyCFG()
-		if err != nil {
+		if err != nil && len(metrics) == 0 {
 			log.Printf("Error getting metrics: %s\n", err)
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
+		}
+		if err != nil {
+			log.Printf("Partial scrape: %s\n", err)
 		}
 	} else {
 		if *verbose {
@@ -663,6 +755,11 @@ func metricsHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Add internal metrics once per scrape.
+	metrics = append(metrics, fmt.Sprintf("usnmp_requests{instance=\"%s\"} %d", *instance, loadRequests()))
+	metrics = append(metrics, fmt.Sprintf("usnmp_errors{instance=\"%s\"} %d", *instance, loadErrors()))
+	metrics = append(metrics, fmt.Sprintf("usnmp_scrape_duration_seconds{instance=\"%s\"} %.6f", *instance, time.Since(start).Seconds()))
+
 	// write the metrics to the http response
 	for _, metric := range metrics {
 		fmt.Fprintf(w, "%s\n", metric)
@@ -675,8 +772,8 @@ func metricsHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func main() {
-	log.Println("Starting usnmp_exporter v1.1 at ", *listenAddress)
 	flag.Parse()
+	log.Printf("Starting up usnmp_exporter v1.2\n")
 
 	// spin up the http server
 	http.HandleFunc("/metrics", metricsHandler)
