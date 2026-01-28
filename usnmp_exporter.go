@@ -66,6 +66,7 @@ type ifMetric struct {
 	ifname        string
 	ifIndex       string
 	ifdescr       string
+	ifalias       string
 	ifhcInOctets  uint64
 	ifhcOutOctets uint64
 	ifMiscCtr     []uint64
@@ -103,12 +104,13 @@ type oidMisc struct {
 }
 
 type snmpDevice struct {
-	Ip        string      `yaml:"ip"`
-	Community string      `yaml:"community"`
-	Version   string      `yaml:"version"`
-	IFMisc    []ifMiscOID `yaml:"ifmisc"`  // Additional interface counters
-	OIDMisc   []oidMisc   `yaml:"oidmisc"` // Additional OIDs
-	Tags      []KV        `yaml:"tags"`    // Tags applied to all metrics for the device
+	Ip           string      `yaml:"ip"`
+	Community    string      `yaml:"community"`
+	Version      string      `yaml:"version"`
+	FetchIfAlias bool        `yaml:"fetch_ifalias"` // Fetch ifAlias (interface description set by admin)
+	IFMisc       []ifMiscOID `yaml:"ifmisc"`        // Additional interface counters
+	OIDMisc      []oidMisc   `yaml:"oidmisc"`       // Additional OIDs
+	Tags         []KV        `yaml:"tags"`          // Tags applied to all metrics for the device
 }
 
 type uptimeTooShortError struct {
@@ -128,7 +130,8 @@ const (
 	IfOutOctets = "1.3.6.1.2.1.2.2.1.16"
 
 	// ifXTable extension (RFC 2863) - 64-bit HC counters
-	ifName           = "1.3.6.1.2.1.31.1.1.1.1"
+	ifName  = "1.3.6.1.2.1.31.1.1.1.1"
+	ifAlias = "1.3.6.1.2.1.31.1.1.1.18" // Interface alias/description set by admin
 	IfHCInUcastPkts  = "1.3.6.1.2.1.31.1.1.1.7"
 	IfHCOutUcastPkts = "1.3.6.1.2.1.31.1.1.1.11"
 	IfHCInOctets     = "1.3.6.1.2.1.31.1.1.1.6"
@@ -172,7 +175,7 @@ func getIfName(goSnmp *gosnmp.GoSNMP, oid string) ([]ifMetric, error) {
 			continue
 		}
 		valueStr := string(variable.Value.([]uint8))
-		ifMetrics = append(ifMetrics, ifMetric{valueStr, ifIndex, "", 0, 0, nil, nil, 0})
+		ifMetrics = append(ifMetrics, ifMetric{valueStr, ifIndex, "", "", 0, 0, nil, nil, 0})
 	}
 	return ifMetrics, nil
 }
@@ -319,9 +322,13 @@ func detectCounterReset(device, ifname string, inOctets, outOctets uint64) {
 	lastCounters[device][outKey] = outOctets
 }
 
-// sanitizeLabel sanitizes a string for use in Prometheus labels by replacing quotes with underscores
+// sanitizeLabel sanitizes a string for use in Prometheus labels by replacing
+// backslash, double quote, and newline with underscores.
 func sanitizeLabel(s string) string {
-	return strings.ReplaceAll(s, "\"", "_")
+	s = strings.ReplaceAll(s, "\\", "_")
+	s = strings.ReplaceAll(s, "\"", "_")
+	s = strings.ReplaceAll(s, "\n", "_")
+	return s
 }
 
 func renderTags(tags []KV) string {
@@ -387,13 +394,18 @@ func formatMetrics(ifMetrics []ifMetric, hostname string, tags []KV) []string {
 	var metrics []string
 	tagStr := renderTags(tags)
 	for _, metric := range ifMetrics {
+		// Include ifAlias label only if it was fetched (non-empty)
+		aliasLabel := ""
+		if metric.ifalias != "" {
+			aliasLabel = fmt.Sprintf(",ifAlias=\"%s\"", metric.ifalias)
+		}
 		//log.Printf("DEBUG: Metric for %s: %s %s %d %d", metric.ifname, metric.ifdescr, metric.ifIndex, metric.ifhcInOctets, metric.ifhcOutOctets)
-		metrics = append(metrics, fmt.Sprintf("ifHCInOctets{host=\"%s\",ifName=\"%s\",ifDescr=\"%s\",ifIndex=\"%s\"%s} %d", hostname, metric.ifname, metric.ifdescr, metric.ifIndex, tagStr, metric.ifhcInOctets))
-		metrics = append(metrics, fmt.Sprintf("ifHCOutOctets{host=\"%s\",ifName=\"%s\",ifDescr=\"%s\",ifIndex=\"%s\"%s} %d", hostname, metric.ifname, metric.ifdescr, metric.ifIndex, tagStr, metric.ifhcOutOctets))
+		metrics = append(metrics, fmt.Sprintf("ifHCInOctets{host=\"%s\",ifName=\"%s\",ifDescr=\"%s\",ifIndex=\"%s\"%s%s} %d", hostname, metric.ifname, metric.ifdescr, metric.ifIndex, aliasLabel, tagStr, metric.ifhcInOctets))
+		metrics = append(metrics, fmt.Sprintf("ifHCOutOctets{host=\"%s\",ifName=\"%s\",ifDescr=\"%s\",ifIndex=\"%s\"%s%s} %d", hostname, metric.ifname, metric.ifdescr, metric.ifIndex, aliasLabel, tagStr, metric.ifhcOutOctets))
 		// Also add misc metrics from config
 		nummusc := len(metric.ifMiscCtr)
 		for i := 0; i < nummusc; i++ {
-			metrics = append(metrics, fmt.Sprintf("%s{host=\"%s\",ifName=\"%s\",ifDescr=\"%s\",ifIndex=\"%s\"%s} %d", metric.ifMiscName[i], hostname, metric.ifname, metric.ifdescr, metric.ifIndex, tagStr, metric.ifMiscCtr[i]))
+			metrics = append(metrics, fmt.Sprintf("%s{host=\"%s\",ifName=\"%s\",ifDescr=\"%s\",ifIndex=\"%s\"%s%s} %d", metric.ifMiscName[i], hostname, metric.ifname, metric.ifdescr, metric.ifIndex, aliasLabel, tagStr, metric.ifMiscCtr[i]))
 		}
 	}
 	return metrics
@@ -496,6 +508,15 @@ func snmpWalk(snmpdev snmpDevice) ([]string, error) {
 		log.Printf("Warning: Could not get ifName for %s (will use ifDescr): %v", device, err)
 	}
 
+	// Optionally fetch ifAlias (admin-set interface description)
+	var ifMetricsAlias []myOids
+	if snmpdev.FetchIfAlias {
+		ifMetricsAlias, err = getIfStr(params, ifAlias)
+		if err != nil && *verbose {
+			log.Printf("Warning: Could not get ifAlias for %s: %v", device, err)
+		}
+	}
+
 	// Try HC (64-bit) counters first from ifXTable
 	ifMetricsInOctets, err := getIfCtr(params, IfHCInOctets)
 	if err != nil && *verbose {
@@ -540,6 +561,10 @@ func snmpWalk(snmpdev snmpDevice) ([]string, error) {
 		// Try to use ifName if available, otherwise keep ifDescr as the interface name
 		if ifName := getByIfIndexStr(ifIdx, ifMetricsName); ifName != "" {
 			ifMetricsTotal[i].ifname = sanitizeLabel(ifName)
+		}
+		// Set ifAlias if fetched
+		if ifAliasVal := getByIfIndexStr(ifIdx, ifMetricsAlias); ifAliasVal != "" {
+			ifMetricsTotal[i].ifalias = sanitizeLabel(ifAliasVal)
 		}
 		// Fill counters - try HC (64-bit) first, fallback to basic (32-bit) if not available
 		inOctets := getByIfIndexInt(ifIdx, ifMetricsInOctets)
