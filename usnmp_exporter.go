@@ -42,6 +42,8 @@ import (
 	"gopkg.in/yaml.v2"         //
 )
 
+const appVersion = "1.4"
+
 var (
 	// Command-line flags
 	// exporter listening address:port
@@ -59,7 +61,11 @@ var (
 	lastDevUptime   = make(map[string]uint64)
 	lastCounters    = make(map[string]map[string]uint64) // deviceIP -> interfaceName -> lastValue
 	warned32BitOnly = make(map[string]bool)              // deviceIP -> warned about 32-bit counters
-	stateMu         sync.Mutex
+	// counterSource caches the chosen counter source per (deviceIP, ifIndex) so we don't
+	// flip between 64-bit HC and 32-bit basic counters between scrapes, which would emit
+	// massive fake spikes to Prometheus. Values: "hc" or "basic".
+	counterSource = make(map[string]map[string]string)
+	stateMu       sync.Mutex
 )
 
 type ifMetric struct {
@@ -120,6 +126,14 @@ func (e *uptimeTooShortError) Error() string {
 	return fmt.Sprintf("device %s uptime less than %d seconds", e.device, e.minperiod)
 }
 
+type deviceDeadError struct {
+	device string
+}
+
+func (e *deviceDeadError) Error() string {
+	return fmt.Sprintf("device %s is dead (sysObjectID probe failed)", e.device)
+}
+
 // 1.3.6.1.2.1.31.1.1.1.6.35
 const (
 	// Basic ifTable (RFC 1213) - 32-bit counters
@@ -134,7 +148,8 @@ const (
 	IfHCInOctets     = "1.3.6.1.2.1.31.1.1.1.6"
 	IfHCOutOctets    = "1.3.6.1.2.1.31.1.1.1.10"
 
-	SysUpTimeOID = "1.3.6.1.2.1.1.3"
+	SysUpTimeOID    = "1.3.6.1.2.1.1.3"
+	SysObjectIDOID  = "1.3.6.1.2.1.1.2.0"
 )
 
 // If we have 1.2.3.4.5.6 oid, then interface index is 6
@@ -417,6 +432,19 @@ func getByIfIndexInt(ifIndex string, metrics []myOids) uint64 {
 	return 0
 }
 
+// hasIfIndex returns true if the walk result contains a PDU for this ifIndex.
+// This is how we detect HC counter support per interface: if ifIndex appears in
+// the HC walk result, the device supports HC for that interface (value may still
+// legitimately be 0 on idle interfaces). If absent, fall back to 32-bit.
+func hasIfIndex(ifIndex string, metrics []myOids) bool {
+	for _, metric := range metrics {
+		if metric.ifIndex == ifIndex {
+			return true
+		}
+	}
+	return false
+}
+
 // func snmpWalk(device string, community string, version string, ifMisc []ifMiscOID) ([]string, error) {
 func snmpWalk(snmpdev snmpDevice) ([]string, error) {
 	device := snmpdev.Ip
@@ -458,7 +486,19 @@ func snmpWalk(snmpdev snmpDevice) ([]string, error) {
 	}
 	defer params.Conn.Close()
 
-	// TODO(nuclearcat): maybe we can do this in one go?
+	// Probe: check if device is alive by querying sysObjectID (mandatory on all SNMP devices)
+	savedTimeout := params.Timeout
+	savedRetries := params.Retries
+	params.Timeout = 3 * time.Second
+	params.Retries = 0
+	incRequests()
+	_, err = params.Get([]string{SysObjectIDOID})
+	params.Timeout = savedTimeout
+	params.Retries = savedRetries
+	if err != nil {
+		incErrors()
+		return nil, &deviceDeadError{device: device}
+	}
 
 	// retrieve uptime
 	sysUpTime, err := getSysUpTime(params)
@@ -541,22 +581,37 @@ func snmpWalk(snmpdev snmpDevice) ([]string, error) {
 		if ifName := getByIfIndexStr(ifIdx, ifMetricsName); ifName != "" {
 			ifMetricsTotal[i].ifname = sanitizeLabel(ifName)
 		}
-		// Fill counters - try HC (64-bit) first, fallback to basic (32-bit) if not available
-		inOctets := getByIfIndexInt(ifIdx, ifMetricsInOctets)
-		outOctets := getByIfIndexInt(ifIdx, ifMetricsOutOctets)
-
-		// If HC counters are 0, try basic counters as fallback
-		if inOctets == 0 {
-			inOctets = getByIfIndexInt(ifIdx, ifMetricsInOctetsBasic)
-			if inOctets > 0 {
-				usedBasicCounters = true
-			}
+		// Pick counter source per (device, ifIndex) and cache it so we don't flip
+		// between HC and basic across scrapes. Prior logic fell back on value==0,
+		// which caused huge fake spikes whenever an HC counter legitimately read 0
+		// or the source swapped between scrapes.
+		stateMu.Lock()
+		if counterSource[device] == nil {
+			counterSource[device] = make(map[string]string)
 		}
-		if outOctets == 0 {
-			outOctets = getByIfIndexInt(ifIdx, ifMetricsOutOctetsBasic)
-			if outOctets > 0 {
-				usedBasicCounters = true
+		src, decided := counterSource[device][ifIdx]
+		if !decided {
+			switch {
+			case hasIfIndex(ifIdx, ifMetricsInOctets) && hasIfIndex(ifIdx, ifMetricsOutOctets):
+				src = "hc"
+			case hasIfIndex(ifIdx, ifMetricsInOctetsBasic) && hasIfIndex(ifIdx, ifMetricsOutOctetsBasic):
+				src = "basic"
+			default:
+				src = "none"
 			}
+			counterSource[device][ifIdx] = src
+		}
+		stateMu.Unlock()
+
+		var inOctets, outOctets uint64
+		switch src {
+		case "hc":
+			inOctets = getByIfIndexInt(ifIdx, ifMetricsInOctets)
+			outOctets = getByIfIndexInt(ifIdx, ifMetricsOutOctets)
+		case "basic":
+			inOctets = getByIfIndexInt(ifIdx, ifMetricsInOctetsBasic)
+			outOctets = getByIfIndexInt(ifIdx, ifMetricsOutOctetsBasic)
+			usedBasicCounters = true
 		}
 
 		ifMetricsTotal[i].ifhcInOctets = inOctets
@@ -689,6 +744,11 @@ func getMetricsbyCFG() ([]string, error) {
 			devmetric, err := snmpWalk(dev)
 			elapsed := time.Since(start)
 			if err != nil {
+				var dde *deviceDeadError
+				if errors.As(err, &dde) {
+					log.Printf("Skipping device %s: %s\n", dde.device, dde.Error())
+					return
+				}
 				var ute *uptimeTooShortError
 				if errors.As(err, &ute) {
 					log.Printf("Skipping device %s: %s\n", ute.device, ute.Error())
@@ -784,7 +844,7 @@ func metricsHandler(w http.ResponseWriter, r *http.Request) {
 
 func main() {
 	flag.Parse()
-	log.Printf("Starting up usnmp_exporter v1.2\n")
+	log.Printf("Starting up usnmp_exporter v%s\n", appVersion)
 
 	// spin up the http server
 	http.HandleFunc("/metrics", metricsHandler)

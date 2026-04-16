@@ -1,6 +1,6 @@
 module example.com/m/v2
 
-go 1.20
+go 1.22
 
 require github.com/gosnmp/gosnmp v1.36.1
 
