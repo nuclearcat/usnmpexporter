@@ -42,7 +42,7 @@ import (
 	"gopkg.in/yaml.v2"         //
 )
 
-const appVersion = "1.4"
+const appVersion = "1.7"
 
 var (
 	// Command-line flags
@@ -52,12 +52,18 @@ var (
 	verbose       = flag.Bool("verbose", false, "Verbose output")
 	minperiod     = flag.Int("minperiod", 15, "Minimum period to get metrics from the snmp device")
 	instance      = flag.String("instance", "usnmp", "Instance name")
+	// Drop ifHCInOctets/ifHCOutOctets samples whose implied rate exceeds this cap.
+	// This catches transient bogus-high values (e.g. Nokia SROS LAG aggregation
+	// glitches) that would otherwise produce huge Prometheus rate() spikes before
+	// the counter "comes back down" and rate() treats it as a reset.
+	maxRateGbps = flag.Float64("maxrate-gbps", 1000.0, "Drop octet samples whose implied rate exceeds this cap (Gbps). 0 disables.")
 )
 
 // internal metrics
 var (
 	Statrequests    int64
 	Staterrors      int64
+	Statdropped     int64 // ifHCInOctets/Out samples dropped by sanity filter
 	lastDevUptime   = make(map[string]uint64)
 	lastCounters    = make(map[string]map[string]uint64) // deviceIP -> interfaceName -> lastValue
 	warned32BitOnly = make(map[string]bool)              // deviceIP -> warned about 32-bit counters
@@ -65,8 +71,133 @@ var (
 	// flip between 64-bit HC and 32-bit basic counters between scrapes, which would emit
 	// massive fake spikes to Prometheus. Values: "hc" or "basic".
 	counterSource = make(map[string]map[string]string)
-	stateMu       sync.Mutex
+	// lastGoodOctets stores the last sane ifHCInOctets/ifHCOutOctets per (device, ifIndex)
+	// with its timestamp, so we can filter out transient bogus-high samples (Nokia SROS
+	// LAG aggregation glitches etc.) by capping the implied rate between samples.
+	lastGoodOctets = make(map[string]map[string]*octetsSample)
+	// walkModeCache remembers the SNMP walk mode that last worked
+	// for a given device IP. First scrape after startup tries
+	// BulkWalk with the default max-repetitions; if that fails with
+	// a parse / decoding error (a "buggy GETBULK encoder" symptom
+	// seen on old NX-OS 6.0(2)U / Catalyst builds) the helper falls
+	// back to a smaller bulk window, then to non-bulk GETNEXT, and
+	// caches whichever worked. Subsequent scrapes skip straight to
+	// the cached mode — no re-paying the retry cost every cycle.
+	// In-memory only by design: process restart re-learns once,
+	// which also picks up devices the operator has just upgraded.
+	walkModeCache  = make(map[string]walkMode)
+	stateMu        sync.Mutex
 )
+
+// walkMode picks how walkAllAdaptive talks to a given device.
+//
+//   - walkBulkDefault: GETBULK at the gosnmp default max-repetitions
+//     (~10). Fast, works for nearly all modern agents.
+//   - walkBulkSmall:   GETBULK with max-repetitions=5. Recovers
+//     agents that truncate UDP responses bigger than ~1400 bytes
+//     (string-heavy tables overflow the buffer).
+//   - walkGetNext:     non-bulk WalkAll (one GETNEXT per row). Slow
+//     but bypasses the agent's GETBULK encoder entirely. Last-resort
+//     fallback for agents that mangle BER on bulk responses no
+//     matter the size.
+type walkMode int
+
+const (
+	walkBulkDefault walkMode = iota
+	walkBulkSmall
+	walkGetNext
+)
+
+// safeBulkReps is the max-repetitions value used in the
+// walkBulkSmall tier. Picked to keep responses comfortably under
+// the 1500-byte safe MTU for the table widths we typically walk.
+const safeBulkReps uint32 = 5
+
+// walkAllAdaptive walks a subtree starting at oid, escalating
+// through fallback strategies on parse/decode failures and caching
+// whichever strategy worked for `ip` so future scrapes skip the
+// retry cost. Network-level failures (timeout, conn refused) are
+// returned as-is — retries can't fix a dead device.
+func walkAllAdaptive(g *gosnmp.GoSNMP, ip, oid string) ([]gosnmp.SnmpPDU, error) {
+	stateMu.Lock()
+	mode := walkModeCache[ip]
+	stateMu.Unlock()
+
+	if mode == walkGetNext {
+		return g.WalkAll(oid)
+	}
+
+	if mode == walkBulkSmall {
+		origReps := g.MaxRepetitions
+		g.MaxRepetitions = safeBulkReps
+		rows, err := g.BulkWalkAll(oid)
+		g.MaxRepetitions = origReps
+		if err == nil || isTimeout(err) {
+			return rows, err
+		}
+		// Smaller bulk also broke — graduate to GETNEXT.
+		stateMu.Lock()
+		walkModeCache[ip] = walkGetNext
+		stateMu.Unlock()
+		log.Printf("walk_adaptive: %s degraded bulk-small → getnext (%v)", ip, err)
+		return g.WalkAll(oid)
+	}
+
+	// walkBulkDefault — first scrape, or the device has only ever
+	// been bulk-friendly. Try the fast path; fall through on parse
+	// errors only.
+	rows, err := g.BulkWalkAll(oid)
+	if err == nil || isTimeout(err) {
+		return rows, err
+	}
+
+	// Step 2: smaller bulk window.
+	origReps := g.MaxRepetitions
+	g.MaxRepetitions = safeBulkReps
+	rows2, err2 := g.BulkWalkAll(oid)
+	g.MaxRepetitions = origReps
+	if err2 == nil {
+		stateMu.Lock()
+		walkModeCache[ip] = walkBulkSmall
+		stateMu.Unlock()
+		log.Printf("walk_adaptive: %s degraded bulk-default → bulk-small (%v)", ip, err)
+		return rows2, nil
+	}
+	if isTimeout(err2) {
+		return rows2, err2
+	}
+
+	// Step 3: non-bulk GETNEXT.
+	rows3, err3 := g.WalkAll(oid)
+	if err3 == nil {
+		stateMu.Lock()
+		walkModeCache[ip] = walkGetNext
+		stateMu.Unlock()
+		log.Printf("walk_adaptive: %s degraded bulk-default → getnext (%v / %v)", ip, err, err2)
+		return rows3, nil
+	}
+	return rows3, err3
+}
+
+// isTimeout returns true for errors that mean "device unreachable"
+// — pointless to retry. Matches gosnmp's "request timeout" wording
+// (marshal.go:206) plus the standard net package phrasings.
+func isTimeout(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := err.Error()
+	return strings.Contains(s, "timeout") ||
+		strings.Contains(s, "i/o timeout") ||
+		strings.Contains(s, "connection refused") ||
+		strings.Contains(s, "no route to host")
+}
+
+type octetsSample struct {
+	in  uint64
+	out uint64
+	ts  int64 // unix seconds
+}
 
 type ifMetric struct {
 	ifname        string
@@ -74,6 +205,8 @@ type ifMetric struct {
 	ifdescr       string
 	ifhcInOctets  uint64
 	ifhcOutOctets uint64
+	ifOperStatus  uint64 // IF-MIB ifOperStatus, polled by default
+	hasOperStatus bool   // false → omit from output (device didn't expose it)
 	ifMiscCtr     []uint64
 	ifMiscName    []string
 	timeStamp     int64
@@ -108,12 +241,32 @@ type oidMisc struct {
 	Tags []KV   `yaml:"tags"` // Tags for the OID
 }
 
+/*
+Walk a tabular OID subtree and emit one Prometheus sample per varbind. The
+remaining sub-OID after BaseOID becomes a single label whose name is
+IndexLabel (default "index") — we deliberately don't try to decode the
+suffix into named index dimensions because that would require shipping a
+MIB compiler. Admins (or upstream tooling) can rename or alias series in
+Prometheus / Grafana once they see the index strings.
+
+Use case: vendor chassis tables (jnxOperatingTemp on JunOS, tmnxHwTemperature
+on Nokia TiMOS). Integer-valued varbinds only; non-integer types are skipped.
+Unlike oidMisc, zero values are emitted (a chassis temp legitimately can be 0).
+*/
+type oidWalk struct {
+	BaseOID    string `yaml:"BaseOID"`    // base OID of the subtree to walk
+	Name       string `yaml:"Name"`       // metric name emitted for each varbind
+	IndexLabel string `yaml:"IndexLabel"` // label name for the OID suffix (default "index")
+	Tags       []KV   `yaml:"tags"`       // static tags applied to every emitted sample
+}
+
 type snmpDevice struct {
 	Ip        string      `yaml:"ip"`
 	Community string      `yaml:"community"`
 	Version   string      `yaml:"version"`
 	IFMisc    []ifMiscOID `yaml:"ifmisc"`  // Additional interface counters
 	OIDMisc   []oidMisc   `yaml:"oidmisc"` // Additional OIDs
+	OIDWalk   []oidWalk   `yaml:"oidwalk"` // Tabular subtree walks (non-ifIndex tables)
 	Tags      []KV        `yaml:"tags"`    // Tags applied to all metrics for the device
 }
 
@@ -137,9 +290,10 @@ func (e *deviceDeadError) Error() string {
 // 1.3.6.1.2.1.31.1.1.1.6.35
 const (
 	// Basic ifTable (RFC 1213) - 32-bit counters
-	IfDescrOID  = "1.3.6.1.2.1.2.2.1.2"
-	IfInOctets  = "1.3.6.1.2.1.2.2.1.10"
-	IfOutOctets = "1.3.6.1.2.1.2.2.1.16"
+	IfDescrOID      = "1.3.6.1.2.1.2.2.1.2"
+	IfOperStatusOID = "1.3.6.1.2.1.2.2.1.8" // 1=up, 2=down, 3=testing, 4=unknown, 5=dormant, 6=notPresent, 7=lowerLayerDown
+	IfInOctets      = "1.3.6.1.2.1.2.2.1.10"
+	IfOutOctets     = "1.3.6.1.2.1.2.2.1.16"
 
 	// ifXTable extension (RFC 2863) - 64-bit HC counters
 	ifName           = "1.3.6.1.2.1.31.1.1.1.1"
@@ -151,6 +305,19 @@ const (
 	SysUpTimeOID    = "1.3.6.1.2.1.1.3"
 	SysObjectIDOID  = "1.3.6.1.2.1.1.2.0"
 )
+
+// isBaselineOID reports whether `oid` (with optional leading dot) is one of
+// the OIDs the exporter polls by default. Used to filter ifmisc entries
+// that would otherwise emit a duplicate series in the same scrape.
+func isBaselineOID(oid string) bool {
+	o := strings.TrimPrefix(oid, ".")
+	switch o {
+	case IfDescrOID, IfOperStatusOID, IfInOctets, IfOutOctets,
+		ifName, IfHCInOctets, IfHCOutOctets:
+		return true
+	}
+	return false
+}
 
 // If we have 1.2.3.4.5.6 oid, then interface index is 6
 func getIfIdxOid(oid string) (string, error) {
@@ -171,7 +338,7 @@ func getIfIdxOid(oid string) (string, error) {
 func getIfName(goSnmp *gosnmp.GoSNMP, oid string) ([]ifMetric, error) {
 	var ifMetrics []ifMetric
 	incRequests()
-	result, err := goSnmp.BulkWalkAll(oid)
+	result, err := walkAllAdaptive(goSnmp, goSnmp.Target, oid)
 	if err != nil {
 		incErrors()
 		return nil, fmt.Errorf("error getting metrics: %s", err)
@@ -187,7 +354,7 @@ func getIfName(goSnmp *gosnmp.GoSNMP, oid string) ([]ifMetric, error) {
 			continue
 		}
 		valueStr := string(variable.Value.([]uint8))
-		ifMetrics = append(ifMetrics, ifMetric{valueStr, ifIndex, "", 0, 0, nil, nil, 0})
+		ifMetrics = append(ifMetrics, ifMetric{ifname: valueStr, ifIndex: ifIndex})
 	}
 	return ifMetrics, nil
 }
@@ -244,7 +411,7 @@ func getOIDUint64(goSnmp *gosnmp.GoSNMP, oid string) (uint64, error) {
 func getIfCtr(goSnmp *gosnmp.GoSNMP, oid string) ([]myOids, error) {
 	var ifMetrics []myOids
 	incRequests()
-	result, err := goSnmp.BulkWalkAll(oid)
+	result, err := walkAllAdaptive(goSnmp, goSnmp.Target, oid)
 	if err != nil {
 		incErrors()
 		return nil, fmt.Errorf("error getting metrics: %s", err)
@@ -286,7 +453,7 @@ func getIfCtr(goSnmp *gosnmp.GoSNMP, oid string) ([]myOids, error) {
 func getIfStr(goSnmp *gosnmp.GoSNMP, oid string) ([]myOids, error) {
 	var ifMetrics []myOids
 	incRequests()
-	result, err := goSnmp.BulkWalkAll(oid)
+	result, err := walkAllAdaptive(goSnmp, goSnmp.Target, oid)
 	if err != nil {
 		incErrors()
 		return nil, fmt.Errorf("error getting metrics: %s", err)
@@ -405,6 +572,9 @@ func formatMetrics(ifMetrics []ifMetric, hostname string, tags []KV) []string {
 		//log.Printf("DEBUG: Metric for %s: %s %s %d %d", metric.ifname, metric.ifdescr, metric.ifIndex, metric.ifhcInOctets, metric.ifhcOutOctets)
 		metrics = append(metrics, fmt.Sprintf("ifHCInOctets{host=\"%s\",ifName=\"%s\",ifDescr=\"%s\",ifIndex=\"%s\"%s} %d", hostname, metric.ifname, metric.ifdescr, metric.ifIndex, tagStr, metric.ifhcInOctets))
 		metrics = append(metrics, fmt.Sprintf("ifHCOutOctets{host=\"%s\",ifName=\"%s\",ifDescr=\"%s\",ifIndex=\"%s\"%s} %d", hostname, metric.ifname, metric.ifdescr, metric.ifIndex, tagStr, metric.ifhcOutOctets))
+		if metric.hasOperStatus {
+			metrics = append(metrics, fmt.Sprintf("ifOperStatus{host=\"%s\",ifName=\"%s\",ifDescr=\"%s\",ifIndex=\"%s\"%s} %d", hostname, metric.ifname, metric.ifdescr, metric.ifIndex, tagStr, metric.ifOperStatus))
+		}
 		// Also add misc metrics from config
 		nummusc := len(metric.ifMiscCtr)
 		for i := 0; i < nummusc; i++ {
@@ -530,41 +700,70 @@ func snmpWalk(snmpdev snmpDevice) ([]string, error) {
 		})
 	}
 
-	// Try to get ifName (IF-MIB extension) - use as better interface name if available
+	// Baseline walk failures below are logged unconditionally (NOT gated on
+	// *verbose). They tell operators why a device is missing core metrics
+	// like ifOperStatus or ifHCInOctets in Prometheus — silent failures
+	// here turn into "no interfaces showing in the dashboard" mysteries
+	// that are impossible to diagnose without restarting the exporter
+	// with a non-default flag.
 	ifMetricsName, err := getIfStr(params, ifName)
-	if err != nil && *verbose {
+	if err != nil {
 		log.Printf("Warning: Could not get ifName for %s (will use ifDescr): %v", device, err)
 	}
 
 	// Try HC (64-bit) counters first from ifXTable
 	ifMetricsInOctets, err := getIfCtr(params, IfHCInOctets)
-	if err != nil && *verbose {
+	if err != nil {
 		log.Printf("Warning: Could not get HC InOctets for %s, will try basic counters: %v", device, err)
 	}
 	ifMetricsOutOctets, err := getIfCtr(params, IfHCOutOctets)
-	if err != nil && *verbose {
+	if err != nil {
 		log.Printf("Warning: Could not get HC OutOctets for %s, will try basic counters: %v", device, err)
 	}
 
 	// Get basic 32-bit counters from ifTable as fallback
 	ifMetricsInOctetsBasic, err := getIfCtr(params, IfInOctets)
-	if err != nil && *verbose {
+	if err != nil {
 		log.Printf("Warning: Could not get basic InOctets for %s: %v", device, err)
 	}
 	ifMetricsOutOctetsBasic, err := getIfCtr(params, IfOutOctets)
-	if err != nil && *verbose {
+	if err != nil {
 		log.Printf("Warning: Could not get basic OutOctets for %s: %v", device, err)
 	}
 
+	// ifOperStatus — polled by default so consumers (e.g. maasmonitor's
+	// Interfaces panel, IfaceDown alerts) see operational state without
+	// the operator having to opt in via ifmisc.
+	ifMetricsOperStatus, err := getIfCtr(params, IfOperStatusOID)
+	if err != nil {
+		log.Printf("Warning: Could not get ifOperStatus for %s: %v", device, err)
+	}
+
 	// get misc as getIfCtr
+	//
+	// Baseline OIDs (ifHCInOctets/Out, ifInOctets/Out, ifDescr, ifName,
+	// ifOperStatus) are walked unconditionally above as part of every
+	// scrape. If an operator-supplied ifmisc entry duplicates one of those,
+	// skip the walk entirely — the format-time filter would drop the
+	// resulting samples anyway and it's wasteful to make the device
+	// service a redundant BulkWalk every scrape. Also catches old
+	// orchestrator-generated configs that pre-date the prefab cleanup.
 	if ifMisc != nil {
 		miscnum := len(ifMisc)
 		if miscnum > 0 {
-			// first fill myOIDs
 			miscMyOIDs = make([][]myOids, miscnum)
 			miscName = make([]string, miscnum)
 			for i := 0; i < miscnum; i++ {
 				miscName[i] = ifMisc[i].Name
+				if isBaselineOID(ifMisc[i].BaseOID) {
+					if *verbose {
+						log.Printf("Skipping ifmisc walk on %s: %s (%s) is already polled as a baseline OID",
+							device, ifMisc[i].BaseOID, ifMisc[i].Name)
+					}
+					// leave miscMyOIDs[i] nil; the format-time loop also
+					// short-circuits on isBaselineOID so nothing is emitted.
+					continue
+				}
 				miscMyOIDs[i], err = getIfCtr(params, ifMisc[i].BaseOID)
 				if err != nil {
 					return nil, fmt.Errorf("error getting metrics: %s", err)
@@ -614,12 +813,78 @@ func snmpWalk(snmpdev snmpDevice) ([]string, error) {
 			usedBasicCounters = true
 		}
 
+		// Sanity-filter transient bogus-high samples. If the implied byte rate
+		// between last good sample and this one exceeds maxRateGbps, the device
+		// almost certainly reported a glitched value (seen on Nokia SROS LAGs
+		// during incomplete member aggregation). Replace with last good so
+		// Prometheus rate() doesn't observe a huge fake delta.
+		now := time.Now().Unix()
+		if *maxRateGbps > 0 && src != "none" {
+			maxBps := uint64(*maxRateGbps * 1e9 / 8) // gbits -> bytes/sec
+			stateMu.Lock()
+			if lastGoodOctets[device] == nil {
+				lastGoodOctets[device] = make(map[string]*octetsSample)
+			}
+			prev := lastGoodOctets[device][ifIdx]
+			accept := true
+			if prev != nil {
+				dt := now - prev.ts
+				if dt <= 0 {
+					dt = 1
+				}
+				// Upward: flag jumps that imply an impossible rate.
+				if inOctets > prev.in && (inOctets-prev.in)/uint64(dt) > maxBps {
+					log.Printf("Rate cap exceeded on %s %s In: %d->%d (%.2f Gbps over %ds, cap %.0f Gbps)",
+						device, ifMetricsTotal[i].ifname, prev.in, inOctets,
+						float64(inOctets-prev.in)*8/1e9/float64(dt), dt, *maxRateGbps)
+					accept = false
+				}
+				if outOctets > prev.out && (outOctets-prev.out)/uint64(dt) > maxBps {
+					log.Printf("Rate cap exceeded on %s %s Out: %d->%d (%.2f Gbps over %ds, cap %.0f Gbps)",
+						device, ifMetricsTotal[i].ifname, prev.out, outOctets,
+						float64(outOctets-prev.out)*8/1e9/float64(dt), dt, *maxRateGbps)
+					accept = false
+				}
+				// Downward but NOT close to zero: suspicious mid-counter drop
+				// (likely Nokia SROS LAG partial aggregation). A real reset or
+				// 32-bit rollover would come back near zero. Threshold: new value
+				// still above half the previous — clearly not a wrap/reset.
+				if inOctets < prev.in && inOctets > prev.in/2 {
+					log.Printf("Suspicious backwards counter on %s %s In: %d->%d (dropped %d bytes, not a rollover)",
+						device, ifMetricsTotal[i].ifname, prev.in, inOctets, prev.in-inOctets)
+				}
+				if outOctets < prev.out && outOctets > prev.out/2 {
+					log.Printf("Suspicious backwards counter on %s %s Out: %d->%d (dropped %d bytes, not a rollover)",
+						device, ifMetricsTotal[i].ifname, prev.out, outOctets, prev.out-outOctets)
+				}
+			}
+			if !accept {
+				atomic.AddInt64(&Statdropped, 1)
+				inOctets = prev.in
+				outOctets = prev.out
+			} else {
+				lastGoodOctets[device][ifIdx] = &octetsSample{in: inOctets, out: outOctets, ts: now}
+			}
+			stateMu.Unlock()
+		}
+
 		ifMetricsTotal[i].ifhcInOctets = inOctets
 		ifMetricsTotal[i].ifhcOutOctets = outOctets
 		// Note: ifdescr is already set from ifMetricsDescr during initialization
+		if hasIfIndex(ifIdx, ifMetricsOperStatus) {
+			ifMetricsTotal[i].ifOperStatus = getByIfIndexInt(ifIdx, ifMetricsOperStatus)
+			ifMetricsTotal[i].hasOperStatus = true
+		}
 		if len(miscMyOIDs) > 0 {
 			// append one by one to ifMetricsTotal[i].ifMiscCtrs , ifMetricsTotal[i].ifMiscNames
 			for j := range miscMyOIDs {
+				// Skip ifmisc entries that duplicate a baseline OID — emitting
+				// the same series twice from one scrape is a Prometheus
+				// scrape error. Existing operator configs that pre-date the
+				// baseline addition keep working.
+				if isBaselineOID(ifMisc[j].BaseOID) {
+					continue
+				}
 				ctr := getByIfIndexInt(ifIdx, miscMyOIDs[j])
 				ifMetricsTotal[i].ifMiscCtr = append(ifMetricsTotal[i].ifMiscCtr, ctr)
 				ifMetricsTotal[i].ifMiscName = append(ifMetricsTotal[i].ifMiscName, miscName[j])
@@ -663,7 +928,88 @@ func snmpWalk(snmpdev snmpDevice) ([]string, error) {
 		}
 	}
 
+	// process oidwalk: walk the subtree, emit one sample per varbind with
+	// the post-base suffix as a single label.
+	for _, w := range snmpdev.OIDWalk {
+		walkMetrics, err := walkOidSubtree(params, device, deviceTags, w)
+		if err != nil {
+			log.Printf("Warning: oidwalk %s on %s failed: %v", w.BaseOID, device, err)
+			continue
+		}
+		mymetrics = append(mymetrics, walkMetrics...)
+	}
+
 	return mymetrics, nil
+}
+
+// walkOidSubtree implements the `oidwalk` config entry: BulkWalk a base OID
+// and emit one Prometheus sample per integer-valued varbind, labeled by
+// the OID suffix that remains after stripping BaseOID. Non-integer values
+// (strings, OctetString, OID, etc.) are skipped — the same restriction as
+// oidmisc, since the exposition format is plain `metric{labels} <integer>`.
+func walkOidSubtree(g *gosnmp.GoSNMP, device string, deviceTags []KV, w oidWalk) ([]string, error) {
+	if w.BaseOID == "" || w.Name == "" {
+		return nil, fmt.Errorf("oidwalk entry missing BaseOID or Name")
+	}
+	indexLabel := w.IndexLabel
+	if indexLabel == "" {
+		indexLabel = "index"
+	}
+	base := strings.TrimPrefix(w.BaseOID, ".")
+
+	incRequests()
+	result, err := walkAllAdaptive(g, device, w.BaseOID)
+	if err != nil {
+		incErrors()
+		return nil, fmt.Errorf("walk: %w", err)
+	}
+
+	out := make([]string, 0, len(result))
+	staticTags := renderTags(deviceTags) + renderTags(w.Tags)
+	for _, v := range result {
+		oid := strings.TrimPrefix(v.Name, ".")
+		// Suffix is whatever is left after removing the base + the dot.
+		// If the walked OID happens to equal the base exactly (rare, scalar
+		// case), the suffix is empty — we still emit it so the operator at
+		// least sees the value land under a known metric name.
+		suffix := ""
+		switch {
+		case oid == base:
+			suffix = ""
+		case strings.HasPrefix(oid, base+"."):
+			suffix = oid[len(base)+1:]
+		default:
+			// gosnmp shouldn't return varbinds outside the requested
+			// subtree, but if it does, ignore them rather than emit a
+			// misleading suffix.
+			continue
+		}
+
+		var value uint64
+		switch x := v.Value.(type) {
+		case uint64:
+			value = x
+		case uint32:
+			value = uint64(x)
+		case uint:
+			value = uint64(x)
+		case int64:
+			value = uint64(x)
+		case int32:
+			value = uint64(x)
+		case int:
+			value = uint64(x)
+		default:
+			// Strings, OctetStrings, IP addresses, etc. — skip silently.
+			// Operators wanting those need to wait for a future extension.
+			continue
+		}
+
+		metric := fmt.Sprintf("%s{host=\"%s\",%s=\"%s\"%s} %d",
+			w.Name, device, indexLabel, sanitizeLabel(suffix), staticTags, value)
+		out = append(out, metric)
+	}
+	return out, nil
 }
 
 /*
@@ -829,6 +1175,7 @@ func metricsHandler(w http.ResponseWriter, r *http.Request) {
 	// Add internal metrics once per scrape.
 	metrics = append(metrics, fmt.Sprintf("usnmp_requests{instance=\"%s\"} %d", *instance, loadRequests()))
 	metrics = append(metrics, fmt.Sprintf("usnmp_errors{instance=\"%s\"} %d", *instance, loadErrors()))
+	metrics = append(metrics, fmt.Sprintf("usnmp_dropped_octets{instance=\"%s\"} %d", *instance, atomic.LoadInt64(&Statdropped)))
 	metrics = append(metrics, fmt.Sprintf("usnmp_exporter_scrape_duration_seconds{instance=\"%s\"} %.6f", *instance, time.Since(start).Seconds()))
 
 	// write the metrics to the http response
