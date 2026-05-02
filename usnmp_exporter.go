@@ -42,7 +42,7 @@ import (
 	"gopkg.in/yaml.v2"         //
 )
 
-const appVersion = "1.7"
+const appVersion = "1.8"
 
 var (
 	// Command-line flags
@@ -52,18 +52,13 @@ var (
 	verbose       = flag.Bool("verbose", false, "Verbose output")
 	minperiod     = flag.Int("minperiod", 15, "Minimum period to get metrics from the snmp device")
 	instance      = flag.String("instance", "usnmp", "Instance name")
-	// Drop ifHCInOctets/ifHCOutOctets samples whose implied rate exceeds this cap.
-	// This catches transient bogus-high values (e.g. Nokia SROS LAG aggregation
-	// glitches) that would otherwise produce huge Prometheus rate() spikes before
-	// the counter "comes back down" and rate() treats it as a reset.
-	maxRateGbps = flag.Float64("maxrate-gbps", 1000.0, "Drop octet samples whose implied rate exceeds this cap (Gbps). 0 disables.")
 )
 
 // internal metrics
 var (
 	Statrequests    int64
 	Staterrors      int64
-	Statdropped     int64 // ifHCInOctets/Out samples dropped by sanity filter
+	Statdropped     int64 // retained for metric stability; no longer incremented
 	lastDevUptime   = make(map[string]uint64)
 	lastCounters    = make(map[string]map[string]uint64) // deviceIP -> interfaceName -> lastValue
 	warned32BitOnly = make(map[string]bool)              // deviceIP -> warned about 32-bit counters
@@ -71,10 +66,6 @@ var (
 	// flip between 64-bit HC and 32-bit basic counters between scrapes, which would emit
 	// massive fake spikes to Prometheus. Values: "hc" or "basic".
 	counterSource = make(map[string]map[string]string)
-	// lastGoodOctets stores the last sane ifHCInOctets/ifHCOutOctets per (device, ifIndex)
-	// with its timestamp, so we can filter out transient bogus-high samples (Nokia SROS
-	// LAG aggregation glitches etc.) by capping the implied rate between samples.
-	lastGoodOctets = make(map[string]map[string]*octetsSample)
 	// walkModeCache remembers the SNMP walk mode that last worked
 	// for a given device IP. First scrape after startup tries
 	// BulkWalk with the default max-repetitions; if that fails with
@@ -193,12 +184,6 @@ func isTimeout(err error) bool {
 		strings.Contains(s, "no route to host")
 }
 
-type octetsSample struct {
-	in  uint64
-	out uint64
-	ts  int64 // unix seconds
-}
-
 type ifMetric struct {
 	ifname        string
 	ifIndex       string
@@ -207,6 +192,11 @@ type ifMetric struct {
 	ifhcOutOctets uint64
 	ifOperStatus  uint64 // IF-MIB ifOperStatus, polled by default
 	hasOperStatus bool   // false → omit from output (device didn't expose it)
+	ifInDiscards  uint64
+	ifOutDiscards uint64
+	ifInErrors    uint64
+	ifOutErrors   uint64
+	hasDiscErrs   bool // false → omit discards/errors from output
 	ifMiscCtr     []uint64
 	ifMiscName    []string
 	timeStamp     int64
@@ -293,7 +283,11 @@ const (
 	IfDescrOID      = "1.3.6.1.2.1.2.2.1.2"
 	IfOperStatusOID = "1.3.6.1.2.1.2.2.1.8" // 1=up, 2=down, 3=testing, 4=unknown, 5=dormant, 6=notPresent, 7=lowerLayerDown
 	IfInOctets      = "1.3.6.1.2.1.2.2.1.10"
+	IfInDiscards    = "1.3.6.1.2.1.2.2.1.13"
+	IfInErrors      = "1.3.6.1.2.1.2.2.1.14"
 	IfOutOctets     = "1.3.6.1.2.1.2.2.1.16"
+	IfOutDiscards   = "1.3.6.1.2.1.2.2.1.19"
+	IfOutErrors     = "1.3.6.1.2.1.2.2.1.20"
 
 	// ifXTable extension (RFC 2863) - 64-bit HC counters
 	ifName           = "1.3.6.1.2.1.31.1.1.1.1"
@@ -313,6 +307,7 @@ func isBaselineOID(oid string) bool {
 	o := strings.TrimPrefix(oid, ".")
 	switch o {
 	case IfDescrOID, IfOperStatusOID, IfInOctets, IfOutOctets,
+		IfInDiscards, IfInErrors, IfOutDiscards, IfOutErrors,
 		ifName, IfHCInOctets, IfHCOutOctets:
 		return true
 	}
@@ -575,6 +570,12 @@ func formatMetrics(ifMetrics []ifMetric, hostname string, tags []KV) []string {
 		if metric.hasOperStatus {
 			metrics = append(metrics, fmt.Sprintf("ifOperStatus{host=\"%s\",ifName=\"%s\",ifDescr=\"%s\",ifIndex=\"%s\"%s} %d", hostname, metric.ifname, metric.ifdescr, metric.ifIndex, tagStr, metric.ifOperStatus))
 		}
+		if metric.hasDiscErrs {
+			metrics = append(metrics, fmt.Sprintf("ifInDiscards{host=\"%s\",ifName=\"%s\",ifDescr=\"%s\",ifIndex=\"%s\"%s} %d", hostname, metric.ifname, metric.ifdescr, metric.ifIndex, tagStr, metric.ifInDiscards))
+			metrics = append(metrics, fmt.Sprintf("ifOutDiscards{host=\"%s\",ifName=\"%s\",ifDescr=\"%s\",ifIndex=\"%s\"%s} %d", hostname, metric.ifname, metric.ifdescr, metric.ifIndex, tagStr, metric.ifOutDiscards))
+			metrics = append(metrics, fmt.Sprintf("ifInErrors{host=\"%s\",ifName=\"%s\",ifDescr=\"%s\",ifIndex=\"%s\"%s} %d", hostname, metric.ifname, metric.ifdescr, metric.ifIndex, tagStr, metric.ifInErrors))
+			metrics = append(metrics, fmt.Sprintf("ifOutErrors{host=\"%s\",ifName=\"%s\",ifDescr=\"%s\",ifIndex=\"%s\"%s} %d", hostname, metric.ifname, metric.ifdescr, metric.ifIndex, tagStr, metric.ifOutErrors))
+		}
 		// Also add misc metrics from config
 		nummusc := len(metric.ifMiscCtr)
 		for i := 0; i < nummusc; i++ {
@@ -739,6 +740,25 @@ func snmpWalk(snmpdev snmpDevice) ([]string, error) {
 		log.Printf("Warning: Could not get ifOperStatus for %s: %v", device, err)
 	}
 
+	// IF-MIB drop/error counters (32-bit Counter32 — no HC variants exist).
+	// Polled by default so dashboards/alerts have access without ifmisc.
+	ifMetricsInDiscards, err := getIfCtr(params, IfInDiscards)
+	if err != nil {
+		log.Printf("Warning: Could not get ifInDiscards for %s: %v", device, err)
+	}
+	ifMetricsOutDiscards, err := getIfCtr(params, IfOutDiscards)
+	if err != nil {
+		log.Printf("Warning: Could not get ifOutDiscards for %s: %v", device, err)
+	}
+	ifMetricsInErrors, err := getIfCtr(params, IfInErrors)
+	if err != nil {
+		log.Printf("Warning: Could not get ifInErrors for %s: %v", device, err)
+	}
+	ifMetricsOutErrors, err := getIfCtr(params, IfOutErrors)
+	if err != nil {
+		log.Printf("Warning: Could not get ifOutErrors for %s: %v", device, err)
+	}
+
 	// get misc as getIfCtr
 	//
 	// Baseline OIDs (ifHCInOctets/Out, ifInOctets/Out, ifDescr, ifName,
@@ -813,67 +833,20 @@ func snmpWalk(snmpdev snmpDevice) ([]string, error) {
 			usedBasicCounters = true
 		}
 
-		// Sanity-filter transient bogus-high samples. If the implied byte rate
-		// between last good sample and this one exceeds maxRateGbps, the device
-		// almost certainly reported a glitched value (seen on Nokia SROS LAGs
-		// during incomplete member aggregation). Replace with last good so
-		// Prometheus rate() doesn't observe a huge fake delta.
-		now := time.Now().Unix()
-		if *maxRateGbps > 0 && src != "none" {
-			maxBps := uint64(*maxRateGbps * 1e9 / 8) // gbits -> bytes/sec
-			stateMu.Lock()
-			if lastGoodOctets[device] == nil {
-				lastGoodOctets[device] = make(map[string]*octetsSample)
-			}
-			prev := lastGoodOctets[device][ifIdx]
-			accept := true
-			if prev != nil {
-				dt := now - prev.ts
-				if dt <= 0 {
-					dt = 1
-				}
-				// Upward: flag jumps that imply an impossible rate.
-				if inOctets > prev.in && (inOctets-prev.in)/uint64(dt) > maxBps {
-					log.Printf("Rate cap exceeded on %s %s In: %d->%d (%.2f Gbps over %ds, cap %.0f Gbps)",
-						device, ifMetricsTotal[i].ifname, prev.in, inOctets,
-						float64(inOctets-prev.in)*8/1e9/float64(dt), dt, *maxRateGbps)
-					accept = false
-				}
-				if outOctets > prev.out && (outOctets-prev.out)/uint64(dt) > maxBps {
-					log.Printf("Rate cap exceeded on %s %s Out: %d->%d (%.2f Gbps over %ds, cap %.0f Gbps)",
-						device, ifMetricsTotal[i].ifname, prev.out, outOctets,
-						float64(outOctets-prev.out)*8/1e9/float64(dt), dt, *maxRateGbps)
-					accept = false
-				}
-				// Downward but NOT close to zero: suspicious mid-counter drop
-				// (likely Nokia SROS LAG partial aggregation). A real reset or
-				// 32-bit rollover would come back near zero. Threshold: new value
-				// still above half the previous — clearly not a wrap/reset.
-				if inOctets < prev.in && inOctets > prev.in/2 {
-					log.Printf("Suspicious backwards counter on %s %s In: %d->%d (dropped %d bytes, not a rollover)",
-						device, ifMetricsTotal[i].ifname, prev.in, inOctets, prev.in-inOctets)
-				}
-				if outOctets < prev.out && outOctets > prev.out/2 {
-					log.Printf("Suspicious backwards counter on %s %s Out: %d->%d (dropped %d bytes, not a rollover)",
-						device, ifMetricsTotal[i].ifname, prev.out, outOctets, prev.out-outOctets)
-				}
-			}
-			if !accept {
-				atomic.AddInt64(&Statdropped, 1)
-				inOctets = prev.in
-				outOctets = prev.out
-			} else {
-				lastGoodOctets[device][ifIdx] = &octetsSample{in: inOctets, out: outOctets, ts: now}
-			}
-			stateMu.Unlock()
-		}
-
 		ifMetricsTotal[i].ifhcInOctets = inOctets
 		ifMetricsTotal[i].ifhcOutOctets = outOctets
 		// Note: ifdescr is already set from ifMetricsDescr during initialization
 		if hasIfIndex(ifIdx, ifMetricsOperStatus) {
 			ifMetricsTotal[i].ifOperStatus = getByIfIndexInt(ifIdx, ifMetricsOperStatus)
 			ifMetricsTotal[i].hasOperStatus = true
+		}
+		if hasIfIndex(ifIdx, ifMetricsInDiscards) || hasIfIndex(ifIdx, ifMetricsOutDiscards) ||
+			hasIfIndex(ifIdx, ifMetricsInErrors) || hasIfIndex(ifIdx, ifMetricsOutErrors) {
+			ifMetricsTotal[i].ifInDiscards = getByIfIndexInt(ifIdx, ifMetricsInDiscards)
+			ifMetricsTotal[i].ifOutDiscards = getByIfIndexInt(ifIdx, ifMetricsOutDiscards)
+			ifMetricsTotal[i].ifInErrors = getByIfIndexInt(ifIdx, ifMetricsInErrors)
+			ifMetricsTotal[i].ifOutErrors = getByIfIndexInt(ifIdx, ifMetricsOutErrors)
+			ifMetricsTotal[i].hasDiscErrs = true
 		}
 		if len(miscMyOIDs) > 0 {
 			// append one by one to ifMetricsTotal[i].ifMiscCtrs , ifMetricsTotal[i].ifMiscNames
