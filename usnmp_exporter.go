@@ -42,7 +42,7 @@ import (
 	"gopkg.in/yaml.v2"         //
 )
 
-const appVersion = "1.8"
+const appVersion = "1.9"
 
 var (
 	// Command-line flags
@@ -244,10 +244,20 @@ on Nokia TiMOS). Integer-valued varbinds only; non-integer types are skipped.
 Unlike oidMisc, zero values are emitted (a chassis temp legitimately can be 0).
 */
 type oidWalk struct {
-	BaseOID    string `yaml:"BaseOID"`    // base OID of the subtree to walk
-	Name       string `yaml:"Name"`       // metric name emitted for each varbind
-	IndexLabel string `yaml:"IndexLabel"` // label name for the OID suffix (default "index")
-	Tags       []KV   `yaml:"tags"`       // static tags applied to every emitted sample
+	BaseOID     string   `yaml:"BaseOID"`    // base OID of the subtree to walk
+	Name        string   `yaml:"Name"`       // metric name emitted for each varbind
+	IndexLabel  string   `yaml:"IndexLabel"` // label name for the OID suffix (default "index"; ignored when IndexLabels is set)
+	IndexLabels []string `yaml:"IndexLabels"`
+	// IndexLabels splits the post-base OID suffix on `.` and assigns the
+	// pieces to each label name in order — for tables with composite
+	// indices like jnxDomCurrentLaneTable {ifIndex, laneIndex} or Nokia
+	// tmnxDDMLaneTable {chassisIndex, tmnxPortPortID, laneId}. If the
+	// suffix has more components than label names, the extras are joined
+	// into the final label with `.` separators (preserves data without
+	// silently dropping). Fewer components than labels → unused labels
+	// are emitted with empty values, which makes the "data malformed"
+	// case obvious in PromQL rather than swallowed.
+	Tags []KV `yaml:"tags"` // static tags applied to every emitted sample
 }
 
 type snmpDevice struct {
@@ -524,14 +534,12 @@ func getSysUpTime(goSnmp *gosnmp.GoSNMP) (uint64, error) {
 	// make sure we have the result
 	if len(result.Variables) == 0 {
 		incErrors()
-		// emulate uptime by getting the current time
-		return uint64(time.Now().Unix()), nil
+		return 0, fmt.Errorf("sysUpTime: empty result")
 	}
 	// prevent "interface conversion: interface {} is nil, not uint64"
 	if result.Variables[0].Value == nil {
 		incErrors()
-		log.Printf("Warning: getting sysUpTime: Value is nil\n")
-		return uint64(time.Now().Unix()), nil
+		return 0, fmt.Errorf("sysUpTime: value is nil")
 	}
 
 	// Handle different integer types that SNMP might return for sysUpTime
@@ -549,8 +557,7 @@ func getSysUpTime(goSnmp *gosnmp.GoSNMP) (uint64, error) {
 	case int:
 		sysUpTime = uint64(v)
 	default:
-		log.Printf("Warning: Unexpected type %T for sysUpTime, value: %v", result.Variables[0].Value, result.Variables[0].Value)
-		return uint64(time.Now().Unix()), nil
+		return 0, fmt.Errorf("sysUpTime: unexpected type %T, value: %v", result.Variables[0].Value, result.Variables[0].Value)
 	}
 
 	return sysUpTime, nil
@@ -671,20 +678,24 @@ func snmpWalk(snmpdev snmpDevice) ([]string, error) {
 		return nil, &deviceDeadError{device: device}
 	}
 
-	// retrieve uptime
-	sysUpTime, err := getSysUpTime(params)
-	if err != nil && *verbose {
-		log.Printf("Warning: Could not get sysUpTime for %s: %v", device, err)
-	}
-	// check if diff is less than minperiod
-	stateMu.Lock()
-	lastUp := lastDevUptime[device]
-	if lastUp != 0 && sysUpTime-lastUp < uint64(*minperiod) {
+	// retrieve uptime; if unavailable, skip the minperiod check (we can't
+	// enforce a rule about uptime we don't know) but still proceed with the scrape
+	sysUpTime, upErr := getSysUpTime(params)
+	if upErr != nil {
+		if *verbose {
+			log.Printf("Warning: Could not get sysUpTime for %s: %v — skipping minperiod check", device, upErr)
+		}
+	} else {
+		// check if diff is less than minperiod
+		stateMu.Lock()
+		lastUp := lastDevUptime[device]
+		if lastUp != 0 && sysUpTime-lastUp < uint64(*minperiod) {
+			stateMu.Unlock()
+			return nil, &uptimeTooShortError{device: device, minperiod: *minperiod}
+		}
+		lastDevUptime[device] = sysUpTime
 		stateMu.Unlock()
-		return nil, &uptimeTooShortError{device: device, minperiod: *minperiod}
 	}
-	lastDevUptime[device] = sysUpTime
-	stateMu.Unlock()
 
 	// Use ifDescr as primary source for interface discovery (more universal, especially on Nokia SROS)
 	ifMetricsDescr, err := getIfStr(params, IfDescrOID)
@@ -924,9 +935,16 @@ func walkOidSubtree(g *gosnmp.GoSNMP, device string, deviceTags []KV, w oidWalk)
 	if w.BaseOID == "" || w.Name == "" {
 		return nil, fmt.Errorf("oidwalk entry missing BaseOID or Name")
 	}
-	indexLabel := w.IndexLabel
-	if indexLabel == "" {
-		indexLabel = "index"
+	// IndexLabels (plural) wins when set; falls back to IndexLabel (singular)
+	// or "index" otherwise. Splitting only happens when ≥2 labels are listed —
+	// a single-element IndexLabels behaves like IndexLabel.
+	labels := w.IndexLabels
+	if len(labels) == 0 {
+		single := w.IndexLabel
+		if single == "" {
+			single = "index"
+		}
+		labels = []string{single}
 	}
 	base := strings.TrimPrefix(w.BaseOID, ".")
 
@@ -958,31 +976,70 @@ func walkOidSubtree(g *gosnmp.GoSNMP, device string, deviceTags []KV, w oidWalk)
 			continue
 		}
 
-		var value uint64
+		// Sign-aware integer cast. SNMP Integer32 columns (e.g. JNX-OPT-IF-MIB
+		// Rx laser power, signed dBm × 100) come through gosnmp as int32 and
+		// can be negative; casting straight to uint64 wraps to 2^64-N which
+		// is garbage in Prometheus exposition. Use int64 throughout so signed
+		// values print correctly via %d. Counter64 values up to 2^63 still
+		// fit; nothing real reaches that.
+		var value int64
 		switch x := v.Value.(type) {
 		case uint64:
-			value = x
+			value = int64(x)
 		case uint32:
-			value = uint64(x)
+			value = int64(x)
 		case uint:
-			value = uint64(x)
+			value = int64(x)
 		case int64:
-			value = uint64(x)
+			value = x
 		case int32:
-			value = uint64(x)
+			value = int64(x) // sign-extend; -2890 → -2890, not 2^64-2890
 		case int:
-			value = uint64(x)
+			value = int64(x)
 		default:
 			// Strings, OctetStrings, IP addresses, etc. — skip silently.
 			// Operators wanting those need to wait for a future extension.
 			continue
 		}
 
-		metric := fmt.Sprintf("%s{host=\"%s\",%s=\"%s\"%s} %d",
-			w.Name, device, indexLabel, sanitizeLabel(suffix), staticTags, value)
+		labelStr := buildIndexLabels(labels, suffix)
+		metric := fmt.Sprintf("%s{host=\"%s\"%s%s} %d",
+			w.Name, device, labelStr, staticTags, value)
 		out = append(out, metric)
 	}
 	return out, nil
+}
+
+// buildIndexLabels splits suffix on `.` and emits one `<label>="<value>"`
+// pair per entry in labels (comma-separated, leading comma when non-empty).
+// More suffix components than labels → extras concatenate into the last
+// label with `.` separators (no data loss, no silent truncation). Fewer
+// components than labels → trailing labels emit empty strings (PromQL filter
+// for "" makes malformed rows obvious instead of swallowed).
+func buildIndexLabels(labels []string, suffix string) string {
+	parts := strings.Split(suffix, ".")
+	if suffix == "" {
+		parts = nil
+	}
+	var b strings.Builder
+	for i, name := range labels {
+		var val string
+		switch {
+		case i == len(labels)-1 && len(parts) > i:
+			// Last label — absorb any extra components.
+			val = strings.Join(parts[i:], ".")
+		case i < len(parts):
+			val = parts[i]
+		default:
+			val = ""
+		}
+		b.WriteString(",")
+		b.WriteString(name)
+		b.WriteString("=\"")
+		b.WriteString(sanitizeLabel(val))
+		b.WriteString("\"")
+	}
+	return b.String()
 }
 
 /*
