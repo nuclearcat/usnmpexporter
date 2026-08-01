@@ -2,6 +2,21 @@
 
 usnmpexporter is a Prometheus exporter for SNMP devices. It is simplified exporter, as existing [snmp_exporter](https://github.com/prometheus/snmp_exporter) is a bit overcomplicated for such trivial task as graphing just few switches and devices.
 
+## Docker
+
+`docker-publish.sh` builds the image and pushes it to `nuclearcat/usnmp_exporter`.
+The tag comes from `appVersion` in `usnmp_exporter.go`, so bump it there before
+releasing; both `<version>` and `latest` are pushed.
+
+```
+./docker-publish.sh                                      # build and push
+./docker-publish.sh --build-only                         # build locally only
+PLATFORMS=linux/amd64,linux/arm64 ./docker-publish.sh     # multi-arch, needs buildx
+IMAGE=me/usnmp ./docker-publish.sh                       # different repository
+```
+
+You need to be logged in (`docker login`) before pushing.
+
 ## Troubleshooting
 
 If you are not getting the expected metrics, you can use `snmpwalk` to check the OIDs that this exporter uses.
@@ -22,6 +37,34 @@ snmpwalk -v 2c -c <community> <device_ip> 1.3.6.1.2.1.31.1.1.1.1
 Replace `<community>` and `<device_ip>` with your SNMP community and device IP address.
 
 This should give you a list of interface names, similar to what the exporter would get. You can do the same for the other OIDs to debug any issues.
+
+## Slow devices / timeouts
+
+A single unanswered SNMP request costs `timeout * (1 + retries)` before the whole
+device scrape is given up, so a device that "fails after 8 seconds" is usually just
+hitting that budget rather than being unreachable.
+
+Global flags:
+
+*   `-timeout` — SNMP request timeout in seconds (default 5)
+*   `-retries` — retries per request (default 1)
+*   `-max-repetitions` — GETBULK max-repetitions (default 50), lower it if the device
+    drops or truncates large replies
+
+They can be overridden per device in the config:
+
+```yaml
+- ip: 10.1.1.1
+  community: public
+  version: 2c
+  timeout: 10
+  retries: 1
+  max_repetitions: 20
+```
+
+Make sure Prometheus `scrape_timeout` for this job is larger than the worst case
+(`timeout * (1 + retries)` plus the walk time), otherwise Prometheus drops the scrape
+before the exporter is done.
 
 ## Custom tags
 

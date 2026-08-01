@@ -52,6 +52,13 @@ var (
 	verbose       = flag.Bool("verbose", false, "Verbose output")
 	minperiod     = flag.Int("minperiod", 15, "Minimum period to get metrics from the snmp device")
 	instance      = flag.String("instance", "usnmp", "Instance name")
+	// Worst case time spent on a single unanswered request is timeout*(1+retries).
+	// Slow devices (Juniper EX series in particular) can take several seconds to
+	// answer a GETBULK over a large ifTable, so keep the timeout generous and the
+	// retry count low instead of the other way around.
+	timeout        = flag.Int("timeout", 5, "SNMP request timeout in seconds")
+	retries        = flag.Int("retries", 1, "SNMP request retries")
+	maxRepetitions = flag.Int("max-repetitions", 50, "GETBULK max-repetitions (lower it if the device drops large replies)")
 )
 
 // internal metrics
@@ -115,6 +122,11 @@ type snmpDevice struct {
 	IFMisc    []ifMiscOID `yaml:"ifmisc"`  // Additional interface counters
 	OIDMisc   []oidMisc   `yaml:"oidmisc"` // Additional OIDs
 	Tags      []KV        `yaml:"tags"`    // Tags applied to all metrics for the device
+	// Per device overrides of the global flags, for devices with a slow SNMP
+	// engine. Unset (zero/nil) means "use the flag value".
+	Timeout        int  `yaml:"timeout"`         // seconds
+	Retries        *int `yaml:"retries"`         // pointer, 0 retries is a valid setting
+	MaxRepetitions int  `yaml:"max_repetitions"` // GETBULK max-repetitions
 }
 
 type uptimeTooShortError struct {
@@ -445,6 +457,28 @@ func hasIfIndex(ifIndex string, metrics []myOids) bool {
 	return false
 }
 
+// needBasicCounters reports whether the 32-bit ifTable walks are still required
+// for this device: either an interface is already pinned to the basic counters,
+// or it is still undecided and did not show up in the HC walk.
+func needBasicCounters(device string, ifaces []ifMetric, hcIn, hcOut []myOids) bool {
+	stateMu.Lock()
+	defer stateMu.Unlock()
+	sources := counterSource[device]
+	for _, iface := range ifaces {
+		src, decided := sources[iface.ifIndex]
+		if !decided {
+			if !hasIfIndex(iface.ifIndex, hcIn) || !hasIfIndex(iface.ifIndex, hcOut) {
+				return true
+			}
+			continue
+		}
+		if src == "basic" {
+			return true
+		}
+	}
+	return false
+}
+
 // func snmpWalk(device string, community string, version string, ifMisc []ifMiscOID) ([]string, error) {
 func snmpWalk(snmpdev snmpDevice) ([]string, error) {
 	device := snmpdev.Ip
@@ -469,14 +503,28 @@ func snmpWalk(snmpdev snmpDevice) ([]string, error) {
 		return nil, fmt.Errorf("unknown snmp version: %s", version)
 	}
 
+	devTimeout := *timeout
+	if snmpdev.Timeout > 0 {
+		devTimeout = snmpdev.Timeout
+	}
+	devRetries := *retries
+	if snmpdev.Retries != nil {
+		devRetries = *snmpdev.Retries
+	}
+	devMaxReps := *maxRepetitions
+	if snmpdev.MaxRepetitions > 0 {
+		devMaxReps = snmpdev.MaxRepetitions
+	}
+
 	// set the snmp parameters
 	params := &gosnmp.GoSNMP{
-		Target:    device,
-		Port:      161,
-		Community: community,
-		Version:   snmpVersion,
-		Timeout:   time.Duration(2) * time.Second,
-		Retries:   3,
+		Target:         device,
+		Port:           161,
+		Community:      community,
+		Version:        snmpVersion,
+		Timeout:        time.Duration(devTimeout) * time.Second,
+		Retries:        devRetries,
+		MaxRepetitions: uint32(devMaxReps),
 	}
 
 	// connect to the snmp device
@@ -487,13 +535,10 @@ func snmpWalk(snmpdev snmpDevice) ([]string, error) {
 	defer params.Conn.Close()
 
 	// Probe: check if device is alive by querying sysObjectID (mandatory on all SNMP devices)
-	savedTimeout := params.Timeout
 	savedRetries := params.Retries
-	params.Timeout = 3 * time.Second
 	params.Retries = 0
 	incRequests()
 	_, err = params.Get([]string{SysObjectIDOID})
-	params.Timeout = savedTimeout
 	params.Retries = savedRetries
 	if err != nil {
 		incErrors()
@@ -546,14 +591,20 @@ func snmpWalk(snmpdev snmpDevice) ([]string, error) {
 		log.Printf("Warning: Could not get HC OutOctets for %s, will try basic counters: %v", device, err)
 	}
 
-	// Get basic 32-bit counters from ifTable as fallback
-	ifMetricsInOctetsBasic, err := getIfCtr(params, IfInOctets)
-	if err != nil && *verbose {
-		log.Printf("Warning: Could not get basic InOctets for %s: %v", device, err)
-	}
-	ifMetricsOutOctetsBasic, err := getIfCtr(params, IfOutOctets)
-	if err != nil && *verbose {
-		log.Printf("Warning: Could not get basic OutOctets for %s: %v", device, err)
+	// Get basic 32-bit counters from ifTable as fallback. These are two extra full
+	// table walks, so only do them when at least one interface actually needs them:
+	// on a device where every interface answered the HC walk and is already pinned
+	// to "hc", they are pure overhead on every scrape.
+	var ifMetricsInOctetsBasic, ifMetricsOutOctetsBasic []myOids
+	if needBasicCounters(device, ifMetricsTotal, ifMetricsInOctets, ifMetricsOutOctets) {
+		ifMetricsInOctetsBasic, err = getIfCtr(params, IfInOctets)
+		if err != nil && *verbose {
+			log.Printf("Warning: Could not get basic InOctets for %s: %v", device, err)
+		}
+		ifMetricsOutOctetsBasic, err = getIfCtr(params, IfOutOctets)
+		if err != nil && *verbose {
+			log.Printf("Warning: Could not get basic OutOctets for %s: %v", device, err)
+		}
 	}
 
 	// get misc as getIfCtr

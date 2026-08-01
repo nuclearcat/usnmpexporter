@@ -29,6 +29,12 @@
 - ip: 10.1.1.1
   community: public
   version: 2c
+  # Optional per device overrides for slow SNMP engines (defaults come from the
+  # -timeout / -retries / -max-repetitions flags). Worst case time spent on one
+  # unanswered request is timeout * (1 + retries).
+  # timeout: 10
+  # retries: 1
+  # max_repetitions: 20
   tags:
     - key: "site"
       value: "dc1"
