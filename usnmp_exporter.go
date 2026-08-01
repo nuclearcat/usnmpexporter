@@ -42,7 +42,7 @@ import (
 	"gopkg.in/yaml.v2"         //
 )
 
-const appVersion = "1.4"
+const appVersion = "1.5"
 
 var (
 	// Command-line flags
