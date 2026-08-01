@@ -63,6 +63,13 @@ They can be overridden per device in the config:
   max_repetitions: 20
 ```
 
+In most cases you should not need `max_repetitions` at all: when a walk fails —
+whether with a decode error or a timeout — the exporter steps the device down to
+a smaller GETBULK window, and then to plain GETNEXT, and remembers what worked
+(`walk_adaptive: <ip> degraded ... ` in the log). One scrape is lost per step
+down. Set `max_repetitions` explicitly only to skip that learning phase on a
+device you already know needs it.
+
 Make sure Prometheus `scrape_timeout` for this job is larger than the worst case
 (`timeout * (1 + retries)` plus the walk time), otherwise Prometheus drops the scrape
 before the exporter is done.

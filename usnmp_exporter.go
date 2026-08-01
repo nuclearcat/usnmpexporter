@@ -42,7 +42,7 @@ import (
 	"gopkg.in/yaml.v2"         //
 )
 
-const appVersion = "2.0"
+const appVersion = "2.1"
 
 var (
 	// Command-line flags
@@ -75,12 +75,14 @@ var (
 	counterSource = make(map[string]map[string]string)
 	// walkModeCache remembers the SNMP walk mode that last worked
 	// for a given device IP. First scrape after startup tries
-	// BulkWalk with the default max-repetitions; if that fails with
+	// BulkWalk at the configured max-repetitions; if that fails with
 	// a parse / decoding error (a "buggy GETBULK encoder" symptom
-	// seen on old NX-OS 6.0(2)U / Catalyst builds) the helper falls
-	// back to a smaller bulk window, then to non-bulk GETNEXT, and
-	// caches whichever worked. Subsequent scrapes skip straight to
-	// the cached mode — no re-paying the retry cost every cycle.
+	// seen on old NX-OS 6.0(2)U / Catalyst builds) or with a timeout
+	// (an oversized reply that never makes it back, seen on Juniper
+	// EX) the helper falls back to a smaller bulk window, then to
+	// non-bulk GETNEXT, and caches whichever worked. Subsequent
+	// scrapes skip straight to the cached mode — no re-paying the
+	// retry cost every cycle.
 	// In-memory only by design: process restart re-learns once,
 	// which also picks up devices the operator has just upgraded.
 	walkModeCache = make(map[string]walkMode)
@@ -89,8 +91,9 @@ var (
 
 // walkMode picks how walkAllAdaptive talks to a given device.
 //
-//   - walkBulkDefault: GETBULK at the gosnmp default max-repetitions
-//     (~10). Fast, works for nearly all modern agents.
+//   - walkBulkDefault: GETBULK at the configured max-repetitions
+//     (-max-repetitions, default 50). Fast, works for nearly all
+//     modern agents.
 //   - walkBulkSmall:   GETBULK with max-repetitions=5. Recovers
 //     agents that truncate UDP responses bigger than ~1400 bytes
 //     (string-heavy tables overflow the buffer).
@@ -111,11 +114,54 @@ const (
 // the 1500-byte safe MTU for the table widths we typically walk.
 const safeBulkReps uint32 = 5
 
-// walkAllAdaptive walks a subtree starting at oid, escalating
-// through fallback strategies on parse/decode failures and caching
-// whichever strategy worked for `ip` so future scrapes skip the
-// retry cost. Network-level failures (timeout, conn refused) are
-// returned as-is — retries can't fix a dead device.
+// bulkWalkWithReps runs a GETBULK walk at a specific max-repetitions
+// and restores the caller's value afterwards. It never raises the
+// window: an operator who pinned max_repetitions below safeBulkReps
+// did so because the device needed it, so the fallback tier must not
+// undo that.
+func bulkWalkWithReps(g *gosnmp.GoSNMP, oid string, reps uint32) ([]gosnmp.SnmpPDU, error) {
+	orig := g.MaxRepetitions
+	if orig > 0 && orig < reps {
+		reps = orig
+	}
+	g.MaxRepetitions = reps
+	defer func() { g.MaxRepetitions = orig }()
+	return g.BulkWalkAll(oid)
+}
+
+// degradeWalkMode pins a device to a slower walk tier. Degradation is
+// one-way — a mode is never walked back up within a process — so
+// concurrent walks against the same device can't fight each other.
+func degradeWalkMode(ip string, to walkMode, from, toName string, cause error) {
+	stateMu.Lock()
+	if walkModeCache[ip] >= to {
+		stateMu.Unlock()
+		return
+	}
+	walkModeCache[ip] = to
+	stateMu.Unlock()
+	log.Printf("walk_adaptive: %s degraded %s → %s (%v)", ip, from, toName, cause)
+}
+
+// walkAllAdaptive walks a subtree starting at oid, escalating through
+// fallback strategies and caching whichever one worked for `ip` so
+// future scrapes skip the retry cost.
+//
+// Timeouts degrade the mode too, not just parse errors. An agent whose
+// GETBULK reply is too large for the path never answers at all, which
+// is indistinguishable from an unreachable device at this layer — and
+// that is exactly the case the smaller bulk window exists to fix.
+// Treating a timeout as fatal left the fallback unreachable for the
+// most common way GETBULK actually fails. snmpWalk probes sysObjectID
+// before any walk runs and bails out with deviceDeadError, so a device
+// reaching this function has already proven it answers SNMP.
+//
+// A timeout has already cost timeout*(1+retries), so we step down one
+// tier and return the error rather than paying it again in the same
+// scrape. The next scrape starts at the lower tier. That trades one
+// failed scrape for automatic recovery instead of a permanently dead
+// device. Parse errors are cheap by comparison and still retry
+// immediately.
 func walkAllAdaptive(g *gosnmp.GoSNMP, ip, oid string) ([]gosnmp.SnmpPDU, error) {
 	stateMu.Lock()
 	mode := walkModeCache[ip]
@@ -126,52 +172,44 @@ func walkAllAdaptive(g *gosnmp.GoSNMP, ip, oid string) ([]gosnmp.SnmpPDU, error)
 	}
 
 	if mode == walkBulkSmall {
-		origReps := g.MaxRepetitions
-		g.MaxRepetitions = safeBulkReps
-		rows, err := g.BulkWalkAll(oid)
-		g.MaxRepetitions = origReps
-		if err == nil || isTimeout(err) {
+		rows, err := bulkWalkWithReps(g, oid, safeBulkReps)
+		if err == nil {
+			return rows, nil
+		}
+		degradeWalkMode(ip, walkGetNext, "bulk-small", "getnext", err)
+		if isTimeout(err) {
 			return rows, err
 		}
-		// Smaller bulk also broke — graduate to GETNEXT.
-		stateMu.Lock()
-		walkModeCache[ip] = walkGetNext
-		stateMu.Unlock()
-		log.Printf("walk_adaptive: %s degraded bulk-small → getnext (%v)", ip, err)
+		// Parse error — GETNEXT is cheap enough to try right away.
 		return g.WalkAll(oid)
 	}
 
 	// walkBulkDefault — first scrape, or the device has only ever
-	// been bulk-friendly. Try the fast path; fall through on parse
-	// errors only.
+	// been bulk-friendly. Try the fast path.
 	rows, err := g.BulkWalkAll(oid)
-	if err == nil || isTimeout(err) {
+	if err == nil {
+		return rows, nil
+	}
+	if isTimeout(err) {
+		degradeWalkMode(ip, walkBulkSmall, "bulk-default", "bulk-small", err)
 		return rows, err
 	}
 
 	// Step 2: smaller bulk window.
-	origReps := g.MaxRepetitions
-	g.MaxRepetitions = safeBulkReps
-	rows2, err2 := g.BulkWalkAll(oid)
-	g.MaxRepetitions = origReps
+	rows2, err2 := bulkWalkWithReps(g, oid, safeBulkReps)
 	if err2 == nil {
-		stateMu.Lock()
-		walkModeCache[ip] = walkBulkSmall
-		stateMu.Unlock()
-		log.Printf("walk_adaptive: %s degraded bulk-default → bulk-small (%v)", ip, err)
+		degradeWalkMode(ip, walkBulkSmall, "bulk-default", "bulk-small", err)
 		return rows2, nil
 	}
 	if isTimeout(err2) {
+		degradeWalkMode(ip, walkGetNext, "bulk-small", "getnext", err2)
 		return rows2, err2
 	}
 
 	// Step 3: non-bulk GETNEXT.
 	rows3, err3 := g.WalkAll(oid)
 	if err3 == nil {
-		stateMu.Lock()
-		walkModeCache[ip] = walkGetNext
-		stateMu.Unlock()
-		log.Printf("walk_adaptive: %s degraded bulk-default → getnext (%v / %v)", ip, err, err2)
+		degradeWalkMode(ip, walkGetNext, "bulk-default", "getnext", err2)
 		return rows3, nil
 	}
 	return rows3, err3

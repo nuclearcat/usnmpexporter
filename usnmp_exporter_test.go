@@ -1,6 +1,62 @@
 package main
 
-import "testing"
+import (
+	"errors"
+	"testing"
+)
+
+// A timeout must degrade the walk mode: a GETBULK reply too large for
+// the path never arrives, which looks exactly like an unreachable
+// device but is fixed by a smaller window. Degradation is one-way, so
+// a later cheaper failure can't promote a device back to a tier that
+// is already known broken.
+func TestDegradeWalkMode(t *testing.T) {
+	const ip = "192.0.2.1"
+	defer func() {
+		stateMu.Lock()
+		delete(walkModeCache, ip)
+		stateMu.Unlock()
+	}()
+
+	cause := errors.New("request timeout (after 1 retries)")
+
+	degradeWalkMode(ip, walkBulkSmall, "bulk-default", "bulk-small", cause)
+	if got := walkModeCache[ip]; got != walkBulkSmall {
+		t.Fatalf("after first degrade: got %v, want walkBulkSmall", got)
+	}
+
+	degradeWalkMode(ip, walkGetNext, "bulk-small", "getnext", cause)
+	if got := walkModeCache[ip]; got != walkGetNext {
+		t.Fatalf("after second degrade: got %v, want walkGetNext", got)
+	}
+
+	// Never walks back up.
+	degradeWalkMode(ip, walkBulkSmall, "bulk-default", "bulk-small", cause)
+	if got := walkModeCache[ip]; got != walkGetNext {
+		t.Fatalf("after attempted upgrade: got %v, want walkGetNext", got)
+	}
+}
+
+// isTimeout drives the degradation path, so it has to recognise the
+// exact wording gosnmp produces as well as the net package phrasings.
+func TestIsTimeout(t *testing.T) {
+	cases := []struct {
+		err  error
+		want bool
+	}{
+		{nil, false},
+		{errors.New("request timeout (after 1 retries)"), true},
+		{errors.New("read udp 10.0.0.1:161: i/o timeout"), true},
+		{errors.New("dial udp 10.0.0.1:161: connection refused"), true},
+		{errors.New("dial udp 10.0.0.1:161: no route to host"), true},
+		{errors.New("unmarshal: unknown ASN.1 type 0xff"), false},
+	}
+	for _, c := range cases {
+		if got := isTimeout(c.err); got != c.want {
+			t.Errorf("isTimeout(%v) = %v, want %v", c.err, got, c.want)
+		}
+	}
+}
 
 // IndexLabels (plural) splits the post-base suffix into named labels.
 // One label → behaves like the legacy IndexLabel (singular). Two-component
