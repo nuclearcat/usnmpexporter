@@ -268,6 +268,11 @@ type snmpDevice struct {
 	OIDMisc   []oidMisc   `yaml:"oidmisc"` // Additional OIDs
 	OIDWalk   []oidWalk   `yaml:"oidwalk"` // Tabular subtree walks (non-ifIndex tables)
 	Tags      []KV        `yaml:"tags"`    // Tags applied to all metrics for the device
+	// Bulk: nil (unset) → adaptive (GETBULK with fallback, default).
+	// false → force GETNEXT (no GETBULK ever issued); for agents that
+	// mishandle bulk regardless of max-repetitions. true is reserved
+	// for future "force bulk, never degrade" semantics — currently a no-op.
+	Bulk *bool `yaml:"bulk"`
 }
 
 type uptimeTooShortError struct {
@@ -631,6 +636,14 @@ func snmpWalk(snmpdev snmpDevice) ([]string, error) {
 	ifMisc := snmpdev.IFMisc
 	oidMisc := snmpdev.OIDMisc
 	deviceTags := snmpdev.Tags
+
+	// Per-device "bulk: false" → pin walkAllAdaptive to GETNEXT before
+	// any walk runs. Idempotent across scrapes.
+	if snmpdev.Bulk != nil && !*snmpdev.Bulk {
+		stateMu.Lock()
+		walkModeCache[device] = walkGetNext
+		stateMu.Unlock()
+	}
 
 	var ifMetricsTotal []ifMetric
 	var snmpVersion gosnmp.SnmpVersion
