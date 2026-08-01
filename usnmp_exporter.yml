@@ -1,3 +1,13 @@
+# Configuration options per device:
+#   ip: Device IP address
+#   community: SNMP community string
+#   version: SNMP version (1 or 2c)
+#   fetch_ifalias: Fetch ifAlias (admin-set port description) as label (default: false)
+#   tags: Custom labels applied to all metrics for this device
+#   ifmisc: Additional per-interface OIDs to poll
+#   oidmisc: Additional scalar OIDs to poll
+#   timeout / retries / max_repetitions: per device SNMP tuning, see README
+#
 # id@router> show snmp mib walk 1 | match Temperature
 # jnxDomCurrentModuleTemperature.558 = 27
 # id@router> show snmp mib walk jnxDomCurrentModuleTemperature | display xml
@@ -29,6 +39,13 @@
 - ip: 10.1.1.1
   community: public
   version: 2c
+  fetch_ifalias: true  # Fetch interface alias/description set by admin (ifAlias OID)
+  # Optional per device overrides for slow SNMP engines (defaults come from the
+  # -timeout / -retries / -max-repetitions flags). Worst case time spent on one
+  # unanswered request is timeout * (1 + retries).
+  # timeout: 10
+  # retries: 1
+  # max_repetitions: 20
   tags:
     - key: "site"
       value: "dc1"

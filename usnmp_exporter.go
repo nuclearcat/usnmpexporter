@@ -27,8 +27,8 @@ Example:
 package main
 
 import (
-	"flag"
 	"errors"
+	"flag"
 	"fmt"
 	"log"
 	"net/http"
@@ -42,7 +42,7 @@ import (
 	"gopkg.in/yaml.v2"         //
 )
 
-const appVersion = "1.9"
+const appVersion = "2.0"
 
 var (
 	// Command-line flags
@@ -52,6 +52,13 @@ var (
 	verbose       = flag.Bool("verbose", false, "Verbose output")
 	minperiod     = flag.Int("minperiod", 15, "Minimum period to get metrics from the snmp device")
 	instance      = flag.String("instance", "usnmp", "Instance name")
+	// Worst case time spent on a single unanswered request is timeout*(1+retries).
+	// Slow devices (Juniper EX series in particular) can take several seconds to
+	// answer a GETBULK over a large ifTable, so keep the timeout generous and the
+	// retry count low instead of the other way around.
+	timeout        = flag.Int("timeout", 5, "SNMP request timeout in seconds")
+	retries        = flag.Int("retries", 1, "SNMP request retries")
+	maxRepetitions = flag.Int("max-repetitions", 50, "GETBULK max-repetitions (lower it if the device drops large replies)")
 )
 
 // internal metrics
@@ -76,8 +83,8 @@ var (
 	// the cached mode — no re-paying the retry cost every cycle.
 	// In-memory only by design: process restart re-learns once,
 	// which also picks up devices the operator has just upgraded.
-	walkModeCache  = make(map[string]walkMode)
-	stateMu        sync.Mutex
+	walkModeCache = make(map[string]walkMode)
+	stateMu       sync.Mutex
 )
 
 // walkMode picks how walkAllAdaptive talks to a given device.
@@ -188,6 +195,7 @@ type ifMetric struct {
 	ifname        string
 	ifIndex       string
 	ifdescr       string
+	ifalias       string
 	ifhcInOctets  uint64
 	ifhcOutOctets uint64
 	ifOperStatus  uint64 // IF-MIB ifOperStatus, polled by default
@@ -261,18 +269,24 @@ type oidWalk struct {
 }
 
 type snmpDevice struct {
-	Ip        string      `yaml:"ip"`
-	Community string      `yaml:"community"`
-	Version   string      `yaml:"version"`
-	IFMisc    []ifMiscOID `yaml:"ifmisc"`  // Additional interface counters
-	OIDMisc   []oidMisc   `yaml:"oidmisc"` // Additional OIDs
-	OIDWalk   []oidWalk   `yaml:"oidwalk"` // Tabular subtree walks (non-ifIndex tables)
-	Tags      []KV        `yaml:"tags"`    // Tags applied to all metrics for the device
+	Ip           string      `yaml:"ip"`
+	Community    string      `yaml:"community"`
+	Version      string      `yaml:"version"`
+	FetchIfAlias bool        `yaml:"fetch_ifalias"` // Fetch ifAlias (interface description set by admin)
+	IFMisc       []ifMiscOID `yaml:"ifmisc"`        // Additional interface counters
+	OIDMisc      []oidMisc   `yaml:"oidmisc"`       // Additional OIDs
+	OIDWalk      []oidWalk   `yaml:"oidwalk"`       // Tabular subtree walks (non-ifIndex tables)
+	Tags         []KV        `yaml:"tags"`          // Tags applied to all metrics for the device
 	// Bulk: nil (unset) → adaptive (GETBULK with fallback, default).
 	// false → force GETNEXT (no GETBULK ever issued); for agents that
 	// mishandle bulk regardless of max-repetitions. true is reserved
 	// for future "force bulk, never degrade" semantics — currently a no-op.
 	Bulk *bool `yaml:"bulk"`
+	// Per device overrides of the global flags, for devices with a slow SNMP
+	// engine. Unset (zero/nil) means "use the flag value".
+	Timeout        int  `yaml:"timeout"`         // seconds
+	Retries        *int `yaml:"retries"`         // pointer, 0 retries is a valid setting
+	MaxRepetitions int  `yaml:"max_repetitions"` // GETBULK max-repetitions
 }
 
 type uptimeTooShortError struct {
@@ -306,13 +320,16 @@ const (
 
 	// ifXTable extension (RFC 2863) - 64-bit HC counters
 	ifName           = "1.3.6.1.2.1.31.1.1.1.1"
+	ifAlias          = "1.3.6.1.2.1.31.1.1.1.18" // Interface alias/description set by admin
 	IfHCInUcastPkts  = "1.3.6.1.2.1.31.1.1.1.7"
 	IfHCOutUcastPkts = "1.3.6.1.2.1.31.1.1.1.11"
 	IfHCInOctets     = "1.3.6.1.2.1.31.1.1.1.6"
 	IfHCOutOctets    = "1.3.6.1.2.1.31.1.1.1.10"
 
-	SysUpTimeOID    = "1.3.6.1.2.1.1.3"
-	SysObjectIDOID  = "1.3.6.1.2.1.1.2.0"
+	// Scalar, so it needs the .0 instance suffix. A GET on the bare 1.3.6.1.2.1.1.3
+	// returns noSuchObject with a nil value, which silently fell back to wall clock.
+	SysUpTimeOID   = "1.3.6.1.2.1.1.3.0"
+	SysObjectIDOID = "1.3.6.1.2.1.1.2.0"
 )
 
 // isBaselineOID reports whether `oid` (with optional leading dot) is one of
@@ -344,14 +361,29 @@ func getIfIdxOid(oid string) (string, error) {
 	return ifIndex, nil
 }
 
+// logWalk reports which table walk took how long, so a slow or stalling OID can
+// be identified from the log instead of guessed at. Verbose only.
+func logWalk(oid string, start time.Time, count int, err error) {
+	if !*verbose {
+		return
+	}
+	if err != nil {
+		log.Printf("Walk %s failed after %s: %v", oid, time.Since(start), err)
+		return
+	}
+	log.Printf("Walk %s: %d values in %s", oid, count, time.Since(start))
+}
+
 // getIfName gets the interface name from the snmp device
 func getIfName(goSnmp *gosnmp.GoSNMP, oid string) ([]ifMetric, error) {
 	var ifMetrics []ifMetric
 	incRequests()
+	start := time.Now()
 	result, err := walkAllAdaptive(goSnmp, goSnmp.Target, oid)
+	logWalk(oid, start, len(result), err)
 	if err != nil {
 		incErrors()
-		return nil, fmt.Errorf("error getting metrics: %s", err)
+		return nil, fmt.Errorf("walk %s: %s", oid, err)
 	}
 
 	// our oid base is 1.3.6.1.2.1.31.1.1.1.1. , after that interface index
@@ -421,10 +453,12 @@ func getOIDUint64(goSnmp *gosnmp.GoSNMP, oid string) (uint64, error) {
 func getIfCtr(goSnmp *gosnmp.GoSNMP, oid string) ([]myOids, error) {
 	var ifMetrics []myOids
 	incRequests()
+	start := time.Now()
 	result, err := walkAllAdaptive(goSnmp, goSnmp.Target, oid)
+	logWalk(oid, start, len(result), err)
 	if err != nil {
 		incErrors()
-		return nil, fmt.Errorf("error getting metrics: %s", err)
+		return nil, fmt.Errorf("walk %s: %s", oid, err)
 	}
 
 	for _, variable := range result {
@@ -463,10 +497,12 @@ func getIfCtr(goSnmp *gosnmp.GoSNMP, oid string) ([]myOids, error) {
 func getIfStr(goSnmp *gosnmp.GoSNMP, oid string) ([]myOids, error) {
 	var ifMetrics []myOids
 	incRequests()
+	start := time.Now()
 	result, err := walkAllAdaptive(goSnmp, goSnmp.Target, oid)
+	logWalk(oid, start, len(result), err)
 	if err != nil {
 		incErrors()
-		return nil, fmt.Errorf("error getting metrics: %s", err)
+		return nil, fmt.Errorf("walk %s: %s", oid, err)
 	}
 
 	for _, variable := range result {
@@ -511,9 +547,13 @@ func detectCounterReset(device, ifname string, inOctets, outOctets uint64) {
 	lastCounters[device][outKey] = outOctets
 }
 
-// sanitizeLabel sanitizes a string for use in Prometheus labels by replacing quotes with underscores
+// sanitizeLabel sanitizes a string for use in Prometheus labels by replacing
+// backslash, double quote, and newline with underscores.
 func sanitizeLabel(s string) string {
-	return strings.ReplaceAll(s, "\"", "_")
+	s = strings.ReplaceAll(s, "\\", "_")
+	s = strings.ReplaceAll(s, "\"", "_")
+	s = strings.ReplaceAll(s, "\n", "_")
+	return s
 }
 
 func renderTags(tags []KV) string {
@@ -576,22 +616,27 @@ func formatMetrics(ifMetrics []ifMetric, hostname string, tags []KV) []string {
 	var metrics []string
 	tagStr := renderTags(tags)
 	for _, metric := range ifMetrics {
+		// Include ifAlias label only if it was fetched (non-empty)
+		aliasLabel := ""
+		if metric.ifalias != "" {
+			aliasLabel = fmt.Sprintf(",ifAlias=\"%s\"", metric.ifalias)
+		}
 		//log.Printf("DEBUG: Metric for %s: %s %s %d %d", metric.ifname, metric.ifdescr, metric.ifIndex, metric.ifhcInOctets, metric.ifhcOutOctets)
-		metrics = append(metrics, fmt.Sprintf("ifHCInOctets{host=\"%s\",ifName=\"%s\",ifDescr=\"%s\",ifIndex=\"%s\"%s} %d", hostname, metric.ifname, metric.ifdescr, metric.ifIndex, tagStr, metric.ifhcInOctets))
-		metrics = append(metrics, fmt.Sprintf("ifHCOutOctets{host=\"%s\",ifName=\"%s\",ifDescr=\"%s\",ifIndex=\"%s\"%s} %d", hostname, metric.ifname, metric.ifdescr, metric.ifIndex, tagStr, metric.ifhcOutOctets))
+		metrics = append(metrics, fmt.Sprintf("ifHCInOctets{host=\"%s\",ifName=\"%s\",ifDescr=\"%s\",ifIndex=\"%s\"%s%s} %d", hostname, metric.ifname, metric.ifdescr, metric.ifIndex, aliasLabel, tagStr, metric.ifhcInOctets))
+		metrics = append(metrics, fmt.Sprintf("ifHCOutOctets{host=\"%s\",ifName=\"%s\",ifDescr=\"%s\",ifIndex=\"%s\"%s%s} %d", hostname, metric.ifname, metric.ifdescr, metric.ifIndex, aliasLabel, tagStr, metric.ifhcOutOctets))
 		if metric.hasOperStatus {
-			metrics = append(metrics, fmt.Sprintf("ifOperStatus{host=\"%s\",ifName=\"%s\",ifDescr=\"%s\",ifIndex=\"%s\"%s} %d", hostname, metric.ifname, metric.ifdescr, metric.ifIndex, tagStr, metric.ifOperStatus))
+			metrics = append(metrics, fmt.Sprintf("ifOperStatus{host=\"%s\",ifName=\"%s\",ifDescr=\"%s\",ifIndex=\"%s\"%s%s} %d", hostname, metric.ifname, metric.ifdescr, metric.ifIndex, aliasLabel, tagStr, metric.ifOperStatus))
 		}
 		if metric.hasDiscErrs {
-			metrics = append(metrics, fmt.Sprintf("ifInDiscards{host=\"%s\",ifName=\"%s\",ifDescr=\"%s\",ifIndex=\"%s\"%s} %d", hostname, metric.ifname, metric.ifdescr, metric.ifIndex, tagStr, metric.ifInDiscards))
-			metrics = append(metrics, fmt.Sprintf("ifOutDiscards{host=\"%s\",ifName=\"%s\",ifDescr=\"%s\",ifIndex=\"%s\"%s} %d", hostname, metric.ifname, metric.ifdescr, metric.ifIndex, tagStr, metric.ifOutDiscards))
-			metrics = append(metrics, fmt.Sprintf("ifInErrors{host=\"%s\",ifName=\"%s\",ifDescr=\"%s\",ifIndex=\"%s\"%s} %d", hostname, metric.ifname, metric.ifdescr, metric.ifIndex, tagStr, metric.ifInErrors))
-			metrics = append(metrics, fmt.Sprintf("ifOutErrors{host=\"%s\",ifName=\"%s\",ifDescr=\"%s\",ifIndex=\"%s\"%s} %d", hostname, metric.ifname, metric.ifdescr, metric.ifIndex, tagStr, metric.ifOutErrors))
+			metrics = append(metrics, fmt.Sprintf("ifInDiscards{host=\"%s\",ifName=\"%s\",ifDescr=\"%s\",ifIndex=\"%s\"%s%s} %d", hostname, metric.ifname, metric.ifdescr, metric.ifIndex, aliasLabel, tagStr, metric.ifInDiscards))
+			metrics = append(metrics, fmt.Sprintf("ifOutDiscards{host=\"%s\",ifName=\"%s\",ifDescr=\"%s\",ifIndex=\"%s\"%s%s} %d", hostname, metric.ifname, metric.ifdescr, metric.ifIndex, aliasLabel, tagStr, metric.ifOutDiscards))
+			metrics = append(metrics, fmt.Sprintf("ifInErrors{host=\"%s\",ifName=\"%s\",ifDescr=\"%s\",ifIndex=\"%s\"%s%s} %d", hostname, metric.ifname, metric.ifdescr, metric.ifIndex, aliasLabel, tagStr, metric.ifInErrors))
+			metrics = append(metrics, fmt.Sprintf("ifOutErrors{host=\"%s\",ifName=\"%s\",ifDescr=\"%s\",ifIndex=\"%s\"%s%s} %d", hostname, metric.ifname, metric.ifdescr, metric.ifIndex, aliasLabel, tagStr, metric.ifOutErrors))
 		}
 		// Also add misc metrics from config
 		nummusc := len(metric.ifMiscCtr)
 		for i := 0; i < nummusc; i++ {
-			metrics = append(metrics, fmt.Sprintf("%s{host=\"%s\",ifName=\"%s\",ifDescr=\"%s\",ifIndex=\"%s\"%s} %d", metric.ifMiscName[i], hostname, metric.ifname, metric.ifdescr, metric.ifIndex, tagStr, metric.ifMiscCtr[i]))
+			metrics = append(metrics, fmt.Sprintf("%s{host=\"%s\",ifName=\"%s\",ifDescr=\"%s\",ifIndex=\"%s\"%s%s} %d", metric.ifMiscName[i], hostname, metric.ifname, metric.ifdescr, metric.ifIndex, aliasLabel, tagStr, metric.ifMiscCtr[i]))
 		}
 	}
 	return metrics
@@ -622,6 +667,28 @@ func getByIfIndexInt(ifIndex string, metrics []myOids) uint64 {
 func hasIfIndex(ifIndex string, metrics []myOids) bool {
 	for _, metric := range metrics {
 		if metric.ifIndex == ifIndex {
+			return true
+		}
+	}
+	return false
+}
+
+// needBasicCounters reports whether the 32-bit ifTable walks are still required
+// for this device: either an interface is already pinned to the basic counters,
+// or it is still undecided and did not show up in the HC walk.
+func needBasicCounters(device string, ifaces []ifMetric, hcIn, hcOut []myOids) bool {
+	stateMu.Lock()
+	defer stateMu.Unlock()
+	sources := counterSource[device]
+	for _, iface := range ifaces {
+		src, decided := sources[iface.ifIndex]
+		if !decided {
+			if !hasIfIndex(iface.ifIndex, hcIn) || !hasIfIndex(iface.ifIndex, hcOut) {
+				return true
+			}
+			continue
+		}
+		if src == "basic" {
 			return true
 		}
 	}
@@ -660,14 +727,28 @@ func snmpWalk(snmpdev snmpDevice) ([]string, error) {
 		return nil, fmt.Errorf("unknown snmp version: %s", version)
 	}
 
+	devTimeout := *timeout
+	if snmpdev.Timeout > 0 {
+		devTimeout = snmpdev.Timeout
+	}
+	devRetries := *retries
+	if snmpdev.Retries != nil {
+		devRetries = *snmpdev.Retries
+	}
+	devMaxReps := *maxRepetitions
+	if snmpdev.MaxRepetitions > 0 {
+		devMaxReps = snmpdev.MaxRepetitions
+	}
+
 	// set the snmp parameters
 	params := &gosnmp.GoSNMP{
-		Target:    device,
-		Port:      161,
-		Community: community,
-		Version:   snmpVersion,
-		Timeout:   time.Duration(2) * time.Second,
-		Retries:   3,
+		Target:         device,
+		Port:           161,
+		Community:      community,
+		Version:        snmpVersion,
+		Timeout:        time.Duration(devTimeout) * time.Second,
+		Retries:        devRetries,
+		MaxRepetitions: uint32(devMaxReps),
 	}
 
 	// connect to the snmp device
@@ -678,13 +759,10 @@ func snmpWalk(snmpdev snmpDevice) ([]string, error) {
 	defer params.Conn.Close()
 
 	// Probe: check if device is alive by querying sysObjectID (mandatory on all SNMP devices)
-	savedTimeout := params.Timeout
 	savedRetries := params.Retries
-	params.Timeout = 3 * time.Second
 	params.Retries = 0
 	incRequests()
 	_, err = params.Get([]string{SysObjectIDOID})
-	params.Timeout = savedTimeout
 	params.Retries = savedRetries
 	if err != nil {
 		incErrors()
@@ -713,7 +791,7 @@ func snmpWalk(snmpdev snmpDevice) ([]string, error) {
 	// Use ifDescr as primary source for interface discovery (more universal, especially on Nokia SROS)
 	ifMetricsDescr, err := getIfStr(params, IfDescrOID)
 	if err != nil {
-		return nil, fmt.Errorf("error getting metrics: %s", err)
+		return nil, fmt.Errorf("device %s: ifDescr: %s", device, err)
 	}
 
 	// Build initial interface list from ifDescr
@@ -736,6 +814,15 @@ func snmpWalk(snmpdev snmpDevice) ([]string, error) {
 		log.Printf("Warning: Could not get ifName for %s (will use ifDescr): %v", device, err)
 	}
 
+	// Optionally fetch ifAlias (admin-set interface description)
+	var ifMetricsAlias []myOids
+	if snmpdev.FetchIfAlias {
+		ifMetricsAlias, err = getIfStr(params, ifAlias)
+		if err != nil && *verbose {
+			log.Printf("Warning: Could not get ifAlias for %s: %v", device, err)
+		}
+	}
+
 	// Try HC (64-bit) counters first from ifXTable
 	ifMetricsInOctets, err := getIfCtr(params, IfHCInOctets)
 	if err != nil {
@@ -746,14 +833,20 @@ func snmpWalk(snmpdev snmpDevice) ([]string, error) {
 		log.Printf("Warning: Could not get HC OutOctets for %s, will try basic counters: %v", device, err)
 	}
 
-	// Get basic 32-bit counters from ifTable as fallback
-	ifMetricsInOctetsBasic, err := getIfCtr(params, IfInOctets)
-	if err != nil {
-		log.Printf("Warning: Could not get basic InOctets for %s: %v", device, err)
-	}
-	ifMetricsOutOctetsBasic, err := getIfCtr(params, IfOutOctets)
-	if err != nil {
-		log.Printf("Warning: Could not get basic OutOctets for %s: %v", device, err)
+	// Get basic 32-bit counters from ifTable as fallback. These are two extra full
+	// table walks, so only do them when at least one interface actually needs them:
+	// on a device where every interface answered the HC walk and is already pinned
+	// to "hc", they are pure overhead on every scrape.
+	var ifMetricsInOctetsBasic, ifMetricsOutOctetsBasic []myOids
+	if needBasicCounters(device, ifMetricsTotal, ifMetricsInOctets, ifMetricsOutOctets) {
+		ifMetricsInOctetsBasic, err = getIfCtr(params, IfInOctets)
+		if err != nil {
+			log.Printf("Warning: Could not get basic InOctets for %s: %v", device, err)
+		}
+		ifMetricsOutOctetsBasic, err = getIfCtr(params, IfOutOctets)
+		if err != nil {
+			log.Printf("Warning: Could not get basic OutOctets for %s: %v", device, err)
+		}
 	}
 
 	// ifOperStatus — polled by default so consumers (e.g. maasmonitor's
@@ -810,7 +903,7 @@ func snmpWalk(snmpdev snmpDevice) ([]string, error) {
 				}
 				miscMyOIDs[i], err = getIfCtr(params, ifMisc[i].BaseOID)
 				if err != nil {
-					return nil, fmt.Errorf("error getting metrics: %s", err)
+					return nil, fmt.Errorf("device %s: ifmisc %s: %s", device, ifMisc[i].Name, err)
 				}
 			}
 		}
@@ -823,6 +916,10 @@ func snmpWalk(snmpdev snmpDevice) ([]string, error) {
 		// Try to use ifName if available, otherwise keep ifDescr as the interface name
 		if ifName := getByIfIndexStr(ifIdx, ifMetricsName); ifName != "" {
 			ifMetricsTotal[i].ifname = sanitizeLabel(ifName)
+		}
+		// Set ifAlias if fetched
+		if ifAliasVal := getByIfIndexStr(ifIdx, ifMetricsAlias); ifAliasVal != "" {
+			ifMetricsTotal[i].ifalias = sanitizeLabel(ifAliasVal)
 		}
 		// Pick counter source per (device, ifIndex) and cache it so we don't flip
 		// between HC and basic across scrapes. Prior logic fell back on value==0,
