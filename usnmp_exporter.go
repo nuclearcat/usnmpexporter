@@ -160,7 +160,9 @@ const (
 	IfHCInOctets     = "1.3.6.1.2.1.31.1.1.1.6"
 	IfHCOutOctets    = "1.3.6.1.2.1.31.1.1.1.10"
 
-	SysUpTimeOID    = "1.3.6.1.2.1.1.3"
+	// Scalar, so it needs the .0 instance suffix. A GET on the bare 1.3.6.1.2.1.1.3
+	// returns noSuchObject with a nil value, which silently fell back to wall clock.
+	SysUpTimeOID    = "1.3.6.1.2.1.1.3.0"
 	SysObjectIDOID  = "1.3.6.1.2.1.1.2.0"
 )
 
@@ -179,14 +181,29 @@ func getIfIdxOid(oid string) (string, error) {
 	return ifIndex, nil
 }
 
+// logWalk reports which table walk took how long, so a slow or stalling OID can
+// be identified from the log instead of guessed at. Verbose only.
+func logWalk(oid string, start time.Time, count int, err error) {
+	if !*verbose {
+		return
+	}
+	if err != nil {
+		log.Printf("Walk %s failed after %s: %v", oid, time.Since(start), err)
+		return
+	}
+	log.Printf("Walk %s: %d values in %s", oid, count, time.Since(start))
+}
+
 // getIfName gets the interface name from the snmp device
 func getIfName(goSnmp *gosnmp.GoSNMP, oid string) ([]ifMetric, error) {
 	var ifMetrics []ifMetric
 	incRequests()
+	start := time.Now()
 	result, err := goSnmp.BulkWalkAll(oid)
+	logWalk(oid, start, len(result), err)
 	if err != nil {
 		incErrors()
-		return nil, fmt.Errorf("error getting metrics: %s", err)
+		return nil, fmt.Errorf("walk %s: %s", oid, err)
 	}
 
 	// our oid base is 1.3.6.1.2.1.31.1.1.1.1. , after that interface index
@@ -256,10 +273,12 @@ func getOIDUint64(goSnmp *gosnmp.GoSNMP, oid string) (uint64, error) {
 func getIfCtr(goSnmp *gosnmp.GoSNMP, oid string) ([]myOids, error) {
 	var ifMetrics []myOids
 	incRequests()
+	start := time.Now()
 	result, err := goSnmp.BulkWalkAll(oid)
+	logWalk(oid, start, len(result), err)
 	if err != nil {
 		incErrors()
-		return nil, fmt.Errorf("error getting metrics: %s", err)
+		return nil, fmt.Errorf("walk %s: %s", oid, err)
 	}
 
 	for _, variable := range result {
@@ -298,10 +317,12 @@ func getIfCtr(goSnmp *gosnmp.GoSNMP, oid string) ([]myOids, error) {
 func getIfStr(goSnmp *gosnmp.GoSNMP, oid string) ([]myOids, error) {
 	var ifMetrics []myOids
 	incRequests()
+	start := time.Now()
 	result, err := goSnmp.BulkWalkAll(oid)
+	logWalk(oid, start, len(result), err)
 	if err != nil {
 		incErrors()
-		return nil, fmt.Errorf("error getting metrics: %s", err)
+		return nil, fmt.Errorf("walk %s: %s", oid, err)
 	}
 
 	for _, variable := range result {
@@ -563,7 +584,7 @@ func snmpWalk(snmpdev snmpDevice) ([]string, error) {
 	// Use ifDescr as primary source for interface discovery (more universal, especially on Nokia SROS)
 	ifMetricsDescr, err := getIfStr(params, IfDescrOID)
 	if err != nil {
-		return nil, fmt.Errorf("error getting metrics: %s", err)
+		return nil, fmt.Errorf("device %s: ifDescr: %s", device, err)
 	}
 
 	// Build initial interface list from ifDescr
@@ -618,7 +639,7 @@ func snmpWalk(snmpdev snmpDevice) ([]string, error) {
 				miscName[i] = ifMisc[i].Name
 				miscMyOIDs[i], err = getIfCtr(params, ifMisc[i].BaseOID)
 				if err != nil {
-					return nil, fmt.Errorf("error getting metrics: %s", err)
+					return nil, fmt.Errorf("device %s: ifmisc %s: %s", device, ifMisc[i].Name, err)
 				}
 			}
 		}
