@@ -42,7 +42,7 @@ import (
 	"gopkg.in/yaml.v2"         //
 )
 
-const appVersion = "2.1"
+const appVersion = "2.3"
 
 var (
 	// Command-line flags
@@ -54,10 +54,12 @@ var (
 	instance      = flag.String("instance", "usnmp", "Instance name")
 	// Worst case time spent on a single unanswered request is timeout*(1+retries).
 	// Slow devices (Juniper EX series in particular) can take several seconds to
-	// answer a GETBULK over a large ifTable, so keep the timeout generous and the
-	// retry count low instead of the other way around.
-	timeout        = flag.Int("timeout", 5, "SNMP request timeout in seconds")
-	retries        = flag.Int("retries", 1, "SNMP request retries")
+	// answer a GETBULK over a large ifTable, so the timeout is generous. Retries
+	// cost nothing on a dead device — the liveness probe in snmpWalk runs with
+	// retries disabled and bails out first — so they only ever pay for genuine
+	// UDP packet loss on a device that is answering.
+	timeout        = flag.Int("timeout", 20, "SNMP request timeout in seconds")
+	retries        = flag.Int("retries", 2, "SNMP request retries")
 	maxRepetitions = flag.Int("max-repetitions", 50, "GETBULK max-repetitions (lower it if the device drops large replies)")
 )
 

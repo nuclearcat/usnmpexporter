@@ -42,13 +42,19 @@ This should give you a list of interface names, similar to what the exporter wou
 ## Slow devices / timeouts
 
 A single unanswered SNMP request costs `timeout * (1 + retries)` before the whole
-device scrape is given up, so a device that "fails after 8 seconds" is usually just
+device scrape is given up, so a device that "fails after 60 seconds" is usually just
 hitting that budget rather than being unreachable.
+
+A device that answers nothing at all is cheaper than that: the liveness probe at the
+start of a scrape runs with retries disabled, so an unreachable device costs one
+`timeout` (20s by default) and is then skipped. The full `timeout * (1 + retries)`
+budget only applies to a device that answered the probe and then went silent
+mid-walk.
 
 Global flags:
 
-*   `-timeout` — SNMP request timeout in seconds (default 5)
-*   `-retries` — retries per request (default 1)
+*   `-timeout` — SNMP request timeout in seconds (default 20)
+*   `-retries` — retries per request (default 2)
 *   `-max-repetitions` — GETBULK max-repetitions (default 50), lower it if the device
     drops or truncates large replies
 
