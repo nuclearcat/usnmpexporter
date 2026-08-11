@@ -19,6 +19,7 @@ func writeTestConfig(t *testing.T, contents string) string {
 func TestLoadConfigRootTimeoutAndRetriesDefaults(t *testing.T) {
 	path := writeTestConfig(t, `
 timeout: 10
+probe_timeout: 5
 retries: 1
 devices:
   - ip: 192.0.2.1
@@ -28,6 +29,7 @@ devices:
     community: public
     version: 2c
     timeout: 30
+    probe_timeout: 8
     retries: 0
 `)
 
@@ -38,11 +40,17 @@ devices:
 	if got := devices[0].Timeout; got != 10 {
 		t.Errorf("first device timeout = %d, want 10", got)
 	}
+	if got := devices[0].ProbeTimeout; got != 5 {
+		t.Errorf("first device probe timeout = %d, want 5", got)
+	}
 	if devices[0].Retries == nil || *devices[0].Retries != 1 {
 		t.Errorf("first device retries = %v, want 1", devices[0].Retries)
 	}
 	if got := devices[1].Timeout; got != 30 {
 		t.Errorf("second device timeout = %d, want 30", got)
+	}
+	if got := devices[1].ProbeTimeout; got != 8 {
+		t.Errorf("second device probe timeout = %d, want 8", got)
 	}
 	if devices[1].Retries == nil || *devices[1].Retries != 0 {
 		t.Errorf("second device retries = %v, want explicit 0", devices[1].Retries)

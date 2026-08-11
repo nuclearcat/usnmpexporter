@@ -6,10 +6,11 @@
 #   tags: Custom labels applied to all metrics for this device
 #   ifmisc: Additional per-interface OIDs to poll
 #   oidmisc: Additional scalar OIDs to poll
-#   timeout / retries / max_repetitions: per device SNMP tuning, see README
+#   timeout / probe_timeout / retries / max_repetitions: per device SNMP tuning, see README
 #
-# To set timeout/retries defaults for all devices, use the mapping form instead:
+# To set timeout/probe_timeout/retries defaults for all devices, use the mapping form instead:
 # timeout: 10
+# probe_timeout: 5
 # retries: 1
 # devices:
 #   - ip: 10.1.1.1

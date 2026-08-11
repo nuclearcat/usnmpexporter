@@ -46,14 +46,15 @@ device scrape is given up, so a device that "fails after 60 seconds" is usually 
 hitting that budget rather than being unreachable.
 
 A device that answers nothing at all is cheaper than that: the liveness probe at the
-start of a scrape runs with retries disabled, so an unreachable device costs one
-`timeout` (20s by default) and is then skipped. The full `timeout * (1 + retries)`
-budget only applies to a device that answered the probe and then went silent
-mid-walk.
+start of a scrape has a separate timeout and runs with retries disabled, so an
+unreachable device costs one `probe_timeout` (10s by default) and is then skipped.
+The full `timeout * (1 + retries)` budget only applies to a device that answered
+the probe and then went silent mid-walk.
 
 Global flags:
 
 *   `-timeout` — SNMP request timeout in seconds (default 20)
+*   `-probe-timeout` — liveness probe timeout in seconds (default 10)
 *   `-retries` — retries per request (default 2)
 *   `-max-repetitions` — GETBULK max-repetitions (default 50), lower it if the device
     drops or truncates large replies
@@ -65,16 +66,18 @@ They can be overridden per device in the config:
   community: public
   version: 2c
   timeout: 10
+  probe_timeout: 5
   retries: 1
   max_repetitions: 20
 ```
 
 To change the defaults for all devices, use the mapping form of the config and
-put `timeout` and `retries` at the root. A value on a device overrides the root
-default; if neither is present, the command-line flag is used:
+put `timeout`, `probe_timeout`, and `retries` at the root. A value on a device
+overrides the root default; if neither is present, the command-line flag is used:
 
 ```yaml
 timeout: 10
+probe_timeout: 5
 retries: 1
 devices:
   - ip: 10.1.1.1
@@ -84,6 +87,7 @@ devices:
     community: public
     version: 2c
     timeout: 30
+    probe_timeout: 8
     retries: 0
 ```
 

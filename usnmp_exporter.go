@@ -55,10 +55,11 @@ var (
 	// Worst case time spent on a single unanswered request is timeout*(1+retries).
 	// Slow devices (Juniper EX series in particular) can take several seconds to
 	// answer a GETBULK over a large ifTable, so the timeout is generous. Retries
-	// cost nothing on a dead device — the liveness probe in snmpWalk runs with
-	// retries disabled and bails out first — so they only ever pay for genuine
-	// UDP packet loss on a device that is answering.
+	// cost nothing on a dead device — the liveness probe in snmpWalk uses its
+	// own timeout, runs with retries disabled, and bails out first — so they only
+	// ever pay for genuine UDP packet loss on a device that is answering.
 	timeout        = flag.Int("timeout", 20, "SNMP request timeout in seconds")
+	probeTimeout   = flag.Int("probe-timeout", 10, "SNMP liveness probe timeout in seconds")
 	retries        = flag.Int("retries", 2, "SNMP request retries")
 	maxRepetitions = flag.Int("max-repetitions", 50, "GETBULK max-repetitions (lower it if the device drops large replies)")
 )
@@ -324,18 +325,21 @@ type snmpDevice struct {
 	Bulk *bool `yaml:"bulk"`
 	// Per device overrides of the global flags, for devices with a slow SNMP
 	// engine. Unset (zero/nil) means "use the flag value".
-	Timeout        int  `yaml:"timeout"`         // seconds
+	Timeout        int  `yaml:"timeout"`         // normal request timeout in seconds
+	ProbeTimeout   int  `yaml:"probe_timeout"`   // liveness probe timeout in seconds
 	Retries        *int `yaml:"retries"`         // pointer, 0 retries is a valid setting
 	MaxRepetitions int  `yaml:"max_repetitions"` // GETBULK max-repetitions
 }
 
-// snmpConfig is the mapping form of the configuration file. Timeout and
-// Retries provide defaults for every device; values set on an individual
-// device take precedence. The legacy top-level device list is still accepted.
+// snmpConfig is the mapping form of the configuration file. Timeout,
+// ProbeTimeout, and Retries provide defaults for every device; values set on an
+// individual device take precedence. The legacy top-level device list is still
+// accepted.
 type snmpConfig struct {
-	Timeout int          `yaml:"timeout"`
-	Retries *int         `yaml:"retries"`
-	Devices []snmpDevice `yaml:"devices"`
+	Timeout      int          `yaml:"timeout"`
+	ProbeTimeout int          `yaml:"probe_timeout"`
+	Retries      *int         `yaml:"retries"`
+	Devices      []snmpDevice `yaml:"devices"`
 }
 
 type uptimeTooShortError struct {
@@ -780,6 +784,10 @@ func snmpWalk(snmpdev snmpDevice) ([]string, error) {
 	if snmpdev.Timeout > 0 {
 		devTimeout = snmpdev.Timeout
 	}
+	devProbeTimeout := *probeTimeout
+	if snmpdev.ProbeTimeout > 0 {
+		devProbeTimeout = snmpdev.ProbeTimeout
+	}
 	devRetries := *retries
 	if snmpdev.Retries != nil {
 		devRetries = *snmpdev.Retries
@@ -807,12 +815,17 @@ func snmpWalk(snmpdev snmpDevice) ([]string, error) {
 	}
 	defer params.Conn.Close()
 
-	// Probe: check if device is alive by querying sysObjectID (mandatory on all SNMP devices)
+	// Probe: check if device is alive by querying sysObjectID (mandatory on all SNMP devices).
+	// Use a shorter, dedicated timeout so a dead host does not inherit the more
+	// generous timeout needed by large walks on slow devices.
 	savedRetries := params.Retries
+	savedTimeout := params.Timeout
 	params.Retries = 0
+	params.Timeout = time.Duration(devProbeTimeout) * time.Second
 	incRequests()
 	_, err = params.Get([]string{SysObjectIDOID})
 	params.Retries = savedRetries
+	params.Timeout = savedTimeout
 	if err != nil {
 		incErrors()
 		return nil, &deviceDeadError{device: device}
@@ -1259,6 +1272,9 @@ func loadConfig(cfgFile string) ([]snmpDevice, error) {
 		for i := range snmpDevices {
 			if snmpDevices[i].Timeout <= 0 && config.Timeout > 0 {
 				snmpDevices[i].Timeout = config.Timeout
+			}
+			if snmpDevices[i].ProbeTimeout <= 0 && config.ProbeTimeout > 0 {
+				snmpDevices[i].ProbeTimeout = config.ProbeTimeout
 			}
 			if snmpDevices[i].Retries == nil && config.Retries != nil {
 				retries := *config.Retries
