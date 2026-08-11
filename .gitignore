@@ -1,2 +1,14 @@
-m
-usnmp_exporter
+# Local application binaries. `go build` uses either the module name (`m`)
+# or the explicit output name used by the Docker build.
+/m
+/usnmp_exporter
+
+# Common Go build, test, coverage, and profiling outputs.
+/bin/
+/dist/
+*.exe
+*.test
+*.out
+*.prof
+*.trace
+coverage.*
