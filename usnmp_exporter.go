@@ -329,6 +329,15 @@ type snmpDevice struct {
 	MaxRepetitions int  `yaml:"max_repetitions"` // GETBULK max-repetitions
 }
 
+// snmpConfig is the mapping form of the configuration file. Timeout and
+// Retries provide defaults for every device; values set on an individual
+// device take precedence. The legacy top-level device list is still accepted.
+type snmpConfig struct {
+	Timeout int          `yaml:"timeout"`
+	Retries *int         `yaml:"retries"`
+	Devices []snmpDevice `yaml:"devices"`
+}
+
 type uptimeTooShortError struct {
 	device    string
 	minperiod int
@@ -1222,16 +1231,42 @@ func getMetricsbyGET(r *http.Request) ([]string, error) {
 */
 
 func loadConfig(cfgFile string) ([]snmpDevice, error) {
-	var snmpDevices []snmpDevice
 	// load the config file
 	yamlFile, err := os.ReadFile(cfgFile)
 	if err != nil {
 		return nil, fmt.Errorf("error reading config file: %s", err)
 	}
-	// parse the yaml file
-	err = yaml.Unmarshal(yamlFile, &snmpDevices)
-	if err != nil {
+
+	// Keep accepting the original top-level sequence while also supporting a
+	// mapping with root-level defaults and a devices sequence.
+	var root interface{}
+	if err := yaml.Unmarshal(yamlFile, &root); err != nil {
 		return nil, fmt.Errorf("error parsing config file: %s", err)
+	}
+
+	var snmpDevices []snmpDevice
+	switch root.(type) {
+	case []interface{}:
+		if err := yaml.Unmarshal(yamlFile, &snmpDevices); err != nil {
+			return nil, fmt.Errorf("error parsing config file: %s", err)
+		}
+	case map[interface{}]interface{}:
+		var config snmpConfig
+		if err := yaml.Unmarshal(yamlFile, &config); err != nil {
+			return nil, fmt.Errorf("error parsing config file: %s", err)
+		}
+		snmpDevices = config.Devices
+		for i := range snmpDevices {
+			if snmpDevices[i].Timeout <= 0 && config.Timeout > 0 {
+				snmpDevices[i].Timeout = config.Timeout
+			}
+			if snmpDevices[i].Retries == nil && config.Retries != nil {
+				retries := *config.Retries
+				snmpDevices[i].Retries = &retries
+			}
+		}
+	default:
+		return nil, fmt.Errorf("error parsing config file: expected a device list or a mapping with a devices list")
 	}
 	if len(snmpDevices) == 0 {
 		return nil, fmt.Errorf("no snmp devices in config file")

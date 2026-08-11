@@ -8,6 +8,15 @@
 #   oidmisc: Additional scalar OIDs to poll
 #   timeout / retries / max_repetitions: per device SNMP tuning, see README
 #
+# To set timeout/retries defaults for all devices, use the mapping form instead:
+# timeout: 10
+# retries: 1
+# devices:
+#   - ip: 10.1.1.1
+#     community: public
+#     version: 2c
+# Per-device values take precedence; the original list form below is supported.
+#
 # id@router> show snmp mib walk 1 | match Temperature
 # jnxDomCurrentModuleTemperature.558 = 27
 # id@router> show snmp mib walk jnxDomCurrentModuleTemperature | display xml

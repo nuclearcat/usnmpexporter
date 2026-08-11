@@ -2,8 +2,68 @@ package main
 
 import (
 	"errors"
+	"os"
+	"path/filepath"
 	"testing"
 )
+
+func writeTestConfig(t *testing.T, contents string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "config.yml")
+	if err := os.WriteFile(path, []byte(contents), 0600); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func TestLoadConfigRootTimeoutAndRetriesDefaults(t *testing.T) {
+	path := writeTestConfig(t, `
+timeout: 10
+retries: 1
+devices:
+  - ip: 192.0.2.1
+    community: public
+    version: 2c
+  - ip: 192.0.2.2
+    community: public
+    version: 2c
+    timeout: 30
+    retries: 0
+`)
+
+	devices, err := loadConfig(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := devices[0].Timeout; got != 10 {
+		t.Errorf("first device timeout = %d, want 10", got)
+	}
+	if devices[0].Retries == nil || *devices[0].Retries != 1 {
+		t.Errorf("first device retries = %v, want 1", devices[0].Retries)
+	}
+	if got := devices[1].Timeout; got != 30 {
+		t.Errorf("second device timeout = %d, want 30", got)
+	}
+	if devices[1].Retries == nil || *devices[1].Retries != 0 {
+		t.Errorf("second device retries = %v, want explicit 0", devices[1].Retries)
+	}
+}
+
+func TestLoadConfigLegacyDeviceList(t *testing.T) {
+	path := writeTestConfig(t, `
+- ip: 192.0.2.1
+  community: public
+  version: 2c
+`)
+
+	devices, err := loadConfig(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(devices) != 1 || devices[0].Ip != "192.0.2.1" {
+		t.Fatalf("unexpected devices: %+v", devices)
+	}
+}
 
 // A timeout must degrade the walk mode: a GETBULK reply too large for
 // the path never arrives, which looks exactly like an unreachable

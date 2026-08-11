@@ -69,6 +69,26 @@ They can be overridden per device in the config:
   max_repetitions: 20
 ```
 
+To change the defaults for all devices, use the mapping form of the config and
+put `timeout` and `retries` at the root. A value on a device overrides the root
+default; if neither is present, the command-line flag is used:
+
+```yaml
+timeout: 10
+retries: 1
+devices:
+  - ip: 10.1.1.1
+    community: public
+    version: 2c
+  - ip: 10.1.1.2
+    community: public
+    version: 2c
+    timeout: 30
+    retries: 0
+```
+
+The original top-level device list remains supported.
+
 In most cases you should not need `max_repetitions` at all: when a walk fails —
 whether with a decode error or a timeout — the exporter steps the device down to
 a smaller GETBULK window, and then to plain GETNEXT, and remembers what worked
