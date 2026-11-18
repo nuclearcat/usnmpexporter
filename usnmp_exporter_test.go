@@ -73,9 +73,8 @@ func TestLoadConfigLegacyDeviceList(t *testing.T) {
 	}
 }
 
-// A timeout must degrade the walk mode: a GETBULK reply too large for
-// the path never arrives, which looks exactly like an unreachable
-// device but is fixed by a smaller window. Degradation is one-way, so
+// Confirmed decoding failures can degrade the walk mode. Degradation is
+// one-way within a process, so
 // a later cheaper failure can't promote a device back to a tier that
 // is already known broken.
 func TestDegradeWalkMode(t *testing.T) {

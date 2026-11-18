@@ -95,12 +95,10 @@ devices:
 
 The original top-level device list remains supported.
 
-In most cases you should not need `max_repetitions` at all: when a walk fails —
-whether with a decode error or a timeout — the exporter steps the device down to
-a smaller GETBULK window, and then to plain GETNEXT, and remembers what worked
-(`walk_adaptive: <ip> degraded ... ` in the log). One scrape is lost per step
-down. Set `max_repetitions` explicitly only to skip that learning phase on a
-device you already know needs it.
+GETBULK starts at the configured batch size. Decode failures try a smaller
+window and then GETNEXT, caching the working fallback. Timeouts return an error
+without permanently changing the walk mode. Set `max_repetitions` explicitly
+for devices needing smaller batches.
 
 Choose a Prometheus `scrape_timeout` longer than the desired device poll budgets
 and a scrape interval longer than that timeout. A whole-device deadline includes
@@ -108,6 +106,42 @@ the probe, retries, and all walks. Expiry discards that device's incomplete
 samples while retaining successful devices. HTTP cancellation closes outstanding
 SNMP connections, and concurrent scrapes cannot overlap polls for the same device.
 Without a device deadline, allow for `timeout * (1 + retries)` plus walk time.
+
+### Per-device request settings without changing generated YAML
+
+When an orchestrator regenerates device YAML, use optional CLI overrides:
+
+```sh
+-device-request-timeout=192.0.2.1=5s
+-device-probe-timeout=192.0.2.1=3s
+-device-probe-retries=192.0.2.1=2
+-device-max-repetitions=192.0.2.1=10
+-device-poll-timeout=192.0.2.1=60s
+```
+
+Each flag accepts comma-separated `IP=value` entries. Request and probe
+timeouts accept positive Go durations; probe retries accept 0–10 and bulk
+repetitions 1–65535. These overrides take precedence over YAML/global defaults
+only for matching devices. The ordinary request retry count continues to use
+the existing YAML/`-retries` setting. Other devices retain their settings,
+including the default liveness probe with no retries.
+
+A request timeout is one unanswered exchange; the whole-device deadline covers
+the probe, all retries and all tables. Set the HTTP scrape timeout above that
+deadline and the scrape interval above the HTTP timeout. For example, a 60s
+device budget fits within a 90s HTTP timeout and a 120s interval.
+
+Temporary request timeouts do **not** permanently downgrade the device to a
+smaller bulk mode or GETNEXT. Decode errors retain the smaller-batch fallback.
+Repeated packet loss should not turn every subsequent poll into a slow
+GETNEXT scan; use an explicit safe batch size for agents needing smaller PDUs.
+
+Failed optional `ifmisc` walks are logged and omitted while already collected
+interface traffic remains available. Missing counter columns are omitted,
+never synthesized as zero; valid zero counters remain valid measurements.
+A failed HC read does not establish lack of HC support or permanently select
+32-bit counters. Whole-device deadline expiry still discards the incomplete
+device poll, and counters are never served from an old scrape.
 
 ## Interface metadata cache
 
