@@ -44,7 +44,7 @@ import (
 	"gopkg.in/yaml.v2"         //
 )
 
-const appVersion = "2.3-thgv-metadata-cache-1"
+const appVersion = "2.3-thgv-request-tuning-2"
 
 var (
 	// Command-line flags
@@ -190,79 +190,74 @@ func degradeWalkMode(ip string, to walkMode, from, toName string, cause error) {
 // fallback strategies and caching whichever one worked for `ip` so
 // future scrapes skip the retry cost.
 //
-// Timeouts degrade the mode too, not just parse errors. An agent whose
-// GETBULK reply is too large for the path never answers at all, which
-// is indistinguishable from an unreachable device at this layer — and
-// that is exactly the case the smaller bulk window exists to fix.
-// Treating a timeout as fatal left the fallback unreachable for the
-// most common way GETBULK actually fails. snmpWalk probes sysObjectID
-// before any walk runs and bails out with deviceDeadError, so a device
-// reaching this function has already proven it answers SNMP.
-//
-// A timeout has already cost timeout*(1+retries), so we step down one
-// tier and return the error rather than paying it again in the same
-// scrape. The next scrape starts at the lower tier. That trades one
-// failed scrape for automatic recovery instead of a permanently dead
-// device. Parse errors are cheap by comparison and still retry
-// immediately.
+// A timeout does not establish that GETBULK is unsupported: UDP loss and
+// temporary agent stalls occur with every batch size. Never let these errors
+// permanently pin an entire device to GETNEXT. Explicit decode errors still
+// try smaller batches. Operators can bound bulk sizes per device when needed.
 func walkAllAdaptive(g *gosnmp.GoSNMP, ip, oid string) ([]gosnmp.SnmpPDU, error) {
-	if g.Context != nil && g.Context.Err() != nil {
-		return nil, g.Context.Err()
+	return adaptiveWalk(g.Context, ip, oid, g.BulkWalkAll,
+		func(oid string) ([]gosnmp.SnmpPDU, error) { return bulkWalkWithReps(g, oid, safeBulkReps) },
+		g.WalkAll)
+}
+
+type subtreeWalker func(string) ([]gosnmp.SnmpPDU, error)
+
+func adaptiveWalk(ctx context.Context, ip, oid string, bulk, small, next subtreeWalker) ([]gosnmp.SnmpPDU, error) {
+	if ctx != nil && ctx.Err() != nil {
+		return nil, ctx.Err()
 	}
 	stateMu.Lock()
 	mode := walkModeCache[ip]
 	stateMu.Unlock()
 
 	if mode == walkGetNext {
-		return g.WalkAll(oid)
+		return next(oid)
 	}
 
 	if mode == walkBulkSmall {
-		rows, err := bulkWalkWithReps(g, oid, safeBulkReps)
+		rows, err := small(oid)
 		if err == nil {
 			return rows, nil
 		}
-		if g.Context != nil && g.Context.Err() != nil {
-			return nil, g.Context.Err()
+		if ctx != nil && ctx.Err() != nil {
+			return nil, ctx.Err()
 		}
-		degradeWalkMode(ip, walkGetNext, "bulk-small", "getnext", err)
 		if isTimeout(err) {
 			return rows, err
 		}
+		degradeWalkMode(ip, walkGetNext, "bulk-small", "getnext", err)
 		// Parse error — GETNEXT is cheap enough to try right away.
-		return g.WalkAll(oid)
+		return next(oid)
 	}
 
 	// walkBulkDefault — first scrape, or the device has only ever
 	// been bulk-friendly. Try the fast path.
-	rows, err := g.BulkWalkAll(oid)
+	rows, err := bulk(oid)
 	if err == nil {
 		return rows, nil
 	}
-	if g.Context != nil && g.Context.Err() != nil {
-		return nil, g.Context.Err()
+	if ctx != nil && ctx.Err() != nil {
+		return nil, ctx.Err()
 	}
 	if isTimeout(err) {
-		degradeWalkMode(ip, walkBulkSmall, "bulk-default", "bulk-small", err)
 		return rows, err
 	}
 
 	// Step 2: smaller bulk window.
-	rows2, err2 := bulkWalkWithReps(g, oid, safeBulkReps)
-	if g.Context != nil && g.Context.Err() != nil {
-		return nil, g.Context.Err()
+	rows2, err2 := small(oid)
+	if ctx != nil && ctx.Err() != nil {
+		return nil, ctx.Err()
 	}
 	if err2 == nil {
 		degradeWalkMode(ip, walkBulkSmall, "bulk-default", "bulk-small", err)
 		return rows2, nil
 	}
 	if isTimeout(err2) {
-		degradeWalkMode(ip, walkGetNext, "bulk-small", "getnext", err2)
 		return rows2, err2
 	}
 
 	// Step 3: non-bulk GETNEXT.
-	rows3, err3 := g.WalkAll(oid)
+	rows3, err3 := next(oid)
 	if err3 == nil {
 		degradeWalkMode(ip, walkGetNext, "bulk-default", "getnext", err2)
 		return rows3, nil
@@ -285,22 +280,26 @@ func isTimeout(err error) bool {
 }
 
 type ifMetric struct {
-	ifname        string
-	ifIndex       string
-	ifdescr       string
-	ifalias       string
-	ifhcInOctets  uint64
-	ifhcOutOctets uint64
-	ifOperStatus  uint64 // IF-MIB ifOperStatus, polled by default
-	hasOperStatus bool   // false → omit from output (device didn't expose it)
-	ifInDiscards  uint64
-	ifOutDiscards uint64
-	ifInErrors    uint64
-	ifOutErrors   uint64
-	hasDiscErrs   bool // false → omit discards/errors from output
-	ifMiscCtr     []uint64
-	ifMiscName    []string
-	timeStamp     int64
+	ifname         string
+	ifIndex        string
+	ifdescr        string
+	ifalias        string
+	ifhcInOctets   uint64
+	ifhcOutOctets  uint64
+	hasOctets      bool   // omit absent counters rather than emitting false zeros
+	ifOperStatus   uint64 // IF-MIB ifOperStatus, polled by default
+	hasOperStatus  bool   // false → omit from output (device didn't expose it)
+	ifInDiscards   uint64
+	ifOutDiscards  uint64
+	ifInErrors     uint64
+	ifOutErrors    uint64
+	hasInDiscards  bool
+	hasOutDiscards bool
+	hasInErrors    bool
+	hasOutErrors   bool
+	ifMiscCtr      []uint64
+	ifMiscName     []string
+	timeStamp      int64
 }
 
 type myOids struct {
@@ -727,15 +726,23 @@ func formatMetrics(ifMetrics []ifMetric, hostname string, tags []KV) []string {
 			aliasLabel = fmt.Sprintf(",ifAlias=\"%s\"", metric.ifalias)
 		}
 		//log.Printf("DEBUG: Metric for %s: %s %s %d %d", metric.ifname, metric.ifdescr, metric.ifIndex, metric.ifhcInOctets, metric.ifhcOutOctets)
-		metrics = append(metrics, fmt.Sprintf("ifHCInOctets{host=\"%s\",ifName=\"%s\",ifDescr=\"%s\",ifIndex=\"%s\"%s%s} %d", hostname, metric.ifname, metric.ifdescr, metric.ifIndex, aliasLabel, tagStr, metric.ifhcInOctets))
-		metrics = append(metrics, fmt.Sprintf("ifHCOutOctets{host=\"%s\",ifName=\"%s\",ifDescr=\"%s\",ifIndex=\"%s\"%s%s} %d", hostname, metric.ifname, metric.ifdescr, metric.ifIndex, aliasLabel, tagStr, metric.ifhcOutOctets))
+		if metric.hasOctets {
+			metrics = append(metrics, fmt.Sprintf("ifHCInOctets{host=\"%s\",ifName=\"%s\",ifDescr=\"%s\",ifIndex=\"%s\"%s%s} %d", hostname, metric.ifname, metric.ifdescr, metric.ifIndex, aliasLabel, tagStr, metric.ifhcInOctets))
+			metrics = append(metrics, fmt.Sprintf("ifHCOutOctets{host=\"%s\",ifName=\"%s\",ifDescr=\"%s\",ifIndex=\"%s\"%s%s} %d", hostname, metric.ifname, metric.ifdescr, metric.ifIndex, aliasLabel, tagStr, metric.ifhcOutOctets))
+		}
 		if metric.hasOperStatus {
 			metrics = append(metrics, fmt.Sprintf("ifOperStatus{host=\"%s\",ifName=\"%s\",ifDescr=\"%s\",ifIndex=\"%s\"%s%s} %d", hostname, metric.ifname, metric.ifdescr, metric.ifIndex, aliasLabel, tagStr, metric.ifOperStatus))
 		}
-		if metric.hasDiscErrs {
+		if metric.hasInDiscards {
 			metrics = append(metrics, fmt.Sprintf("ifInDiscards{host=\"%s\",ifName=\"%s\",ifDescr=\"%s\",ifIndex=\"%s\"%s%s} %d", hostname, metric.ifname, metric.ifdescr, metric.ifIndex, aliasLabel, tagStr, metric.ifInDiscards))
+		}
+		if metric.hasOutDiscards {
 			metrics = append(metrics, fmt.Sprintf("ifOutDiscards{host=\"%s\",ifName=\"%s\",ifDescr=\"%s\",ifIndex=\"%s\"%s%s} %d", hostname, metric.ifname, metric.ifdescr, metric.ifIndex, aliasLabel, tagStr, metric.ifOutDiscards))
+		}
+		if metric.hasInErrors {
 			metrics = append(metrics, fmt.Sprintf("ifInErrors{host=\"%s\",ifName=\"%s\",ifDescr=\"%s\",ifIndex=\"%s\"%s%s} %d", hostname, metric.ifname, metric.ifdescr, metric.ifIndex, aliasLabel, tagStr, metric.ifInErrors))
+		}
+		if metric.hasOutErrors {
 			metrics = append(metrics, fmt.Sprintf("ifOutErrors{host=\"%s\",ifName=\"%s\",ifDescr=\"%s\",ifIndex=\"%s\"%s%s} %d", hostname, metric.ifname, metric.ifdescr, metric.ifIndex, aliasLabel, tagStr, metric.ifOutErrors))
 		}
 		// Also add misc metrics from config
@@ -884,6 +891,12 @@ func snmpWalk(ctx context.Context, snmpdev snmpDevice) (metrics []string, walkEr
 		Retries:        devRetries,
 		MaxRepetitions: uint32(devMaxReps),
 	}
+	probeRequestTimeout := time.Duration(devProbeTimeout) * time.Second
+	probeRequestRetries := 0
+	probeRequestTimeout, probeRequestRetries = applyRequestTuning(device, params, probeRequestTimeout, probeRequestRetries)
+	if *verbose {
+		log.Printf("SNMP settings %s: request-timeout=%s retries=%d probe-timeout=%s probe-retries=%d max-repetitions=%d", device, params.Timeout, params.Retries, probeRequestTimeout, probeRequestRetries, params.MaxRepetitions)
+	}
 
 	// connect to the snmp device
 	closeSNMP, err := connectSNMP(ctx, params)
@@ -897,8 +910,8 @@ func snmpWalk(ctx context.Context, snmpdev snmpDevice) (metrics []string, walkEr
 	// generous timeout needed by large walks on slow devices.
 	savedRetries := params.Retries
 	savedTimeout := params.Timeout
-	params.Retries = 0
-	params.Timeout = time.Duration(devProbeTimeout) * time.Second
+	params.Retries = probeRequestRetries
+	params.Timeout = probeRequestTimeout
 	incRequests()
 	_, err = params.Get([]string{SysObjectIDOID})
 	params.Retries = savedRetries
@@ -983,13 +996,13 @@ func snmpWalk(ctx context.Context, snmpdev snmpDevice) (metrics []string, walkEr
 	}
 
 	// Try HC (64-bit) counters first from ifXTable
-	ifMetricsInOctets, err := getIfCtr(params, IfHCInOctets)
-	if err != nil {
-		log.Printf("Warning: Could not get HC InOctets for %s, will try basic counters: %v", device, err)
+	ifMetricsInOctets, hcInErr := getIfCtr(params, IfHCInOctets)
+	if hcInErr != nil {
+		log.Printf("Warning: Could not get HC InOctets for %s: %v", device, hcInErr)
 	}
-	ifMetricsOutOctets, err := getIfCtr(params, IfHCOutOctets)
-	if err != nil {
-		log.Printf("Warning: Could not get HC OutOctets for %s, will try basic counters: %v", device, err)
+	ifMetricsOutOctets, hcOutErr := getIfCtr(params, IfHCOutOctets)
+	if hcOutErr != nil {
+		log.Printf("Warning: Could not get HC OutOctets for %s: %v", device, hcOutErr)
 	}
 
 	// Get basic 32-bit counters from ifTable as fallback. These are two extra full
@@ -997,7 +1010,9 @@ func snmpWalk(ctx context.Context, snmpdev snmpDevice) (metrics []string, walkEr
 	// on a device where every interface answered the HC walk and is already pinned
 	// to "hc", they are pure overhead on every scrape.
 	var ifMetricsInOctetsBasic, ifMetricsOutOctetsBasic []myOids
-	if needBasicCounters(device, ifMetricsTotal, ifMetricsInOctets, ifMetricsOutOctets) {
+	// A failed HC request does not establish lack of HC support. Do not pin
+	// the device to wrapping 32-bit counters after temporary packet loss.
+	if hcInErr == nil && hcOutErr == nil && needBasicCounters(device, ifMetricsTotal, ifMetricsInOctets, ifMetricsOutOctets) {
 		ifMetricsInOctetsBasic, err = getIfCtr(params, IfInOctets)
 		if err != nil {
 			log.Printf("Warning: Could not get basic InOctets for %s: %v", device, err)
@@ -1062,7 +1077,8 @@ func snmpWalk(ctx context.Context, snmpdev snmpDevice) (metrics []string, walkEr
 				}
 				miscMyOIDs[i], err = metadata.getCtr(ctx, params, ifMisc[i].BaseOID)
 				if err != nil {
-					return nil, fmt.Errorf("device %s: ifmisc %s: %s", device, ifMisc[i].Name, err)
+					log.Printf("Warning: omitting ifmisc %s on %s: %v", ifMisc[i].Name, device, err)
+					miscMyOIDs[i] = nil
 				}
 			}
 		}
@@ -1101,16 +1117,20 @@ func snmpWalk(ctx context.Context, snmpdev snmpDevice) (metrics []string, walkEr
 			default:
 				src = "none"
 			}
-			counterSource[device][ifIdx] = src
+			if src != "none" {
+				counterSource[device][ifIdx] = src
+			}
 		}
 		stateMu.Unlock()
 
 		var inOctets, outOctets uint64
 		switch src {
 		case "hc":
+			ifMetricsTotal[i].hasOctets = hasIfIndex(ifIdx, ifMetricsInOctets) && hasIfIndex(ifIdx, ifMetricsOutOctets)
 			inOctets = getByIfIndexInt(ifIdx, ifMetricsInOctets)
 			outOctets = getByIfIndexInt(ifIdx, ifMetricsOutOctets)
 		case "basic":
+			ifMetricsTotal[i].hasOctets = hasIfIndex(ifIdx, ifMetricsInOctetsBasic) && hasIfIndex(ifIdx, ifMetricsOutOctetsBasic)
 			inOctets = getByIfIndexInt(ifIdx, ifMetricsInOctetsBasic)
 			outOctets = getByIfIndexInt(ifIdx, ifMetricsOutOctetsBasic)
 			usedBasicCounters = true
@@ -1129,7 +1149,10 @@ func snmpWalk(ctx context.Context, snmpdev snmpDevice) (metrics []string, walkEr
 			ifMetricsTotal[i].ifOutDiscards = getByIfIndexInt(ifIdx, ifMetricsOutDiscards)
 			ifMetricsTotal[i].ifInErrors = getByIfIndexInt(ifIdx, ifMetricsInErrors)
 			ifMetricsTotal[i].ifOutErrors = getByIfIndexInt(ifIdx, ifMetricsOutErrors)
-			ifMetricsTotal[i].hasDiscErrs = true
+			ifMetricsTotal[i].hasInDiscards = hasIfIndex(ifIdx, ifMetricsInDiscards)
+			ifMetricsTotal[i].hasOutDiscards = hasIfIndex(ifIdx, ifMetricsOutDiscards)
+			ifMetricsTotal[i].hasInErrors = hasIfIndex(ifIdx, ifMetricsInErrors)
+			ifMetricsTotal[i].hasOutErrors = hasIfIndex(ifIdx, ifMetricsOutErrors)
 		}
 		if len(miscMyOIDs) > 0 {
 			// append one by one to ifMetricsTotal[i].ifMiscCtrs , ifMetricsTotal[i].ifMiscNames
@@ -1139,6 +1162,9 @@ func snmpWalk(ctx context.Context, snmpdev snmpDevice) (metrics []string, walkEr
 				// scrape error. Existing operator configs that pre-date the
 				// baseline addition keep working.
 				if isBaselineOID(ifMisc[j].BaseOID) {
+					continue
+				}
+				if !hasIfIndex(ifIdx, miscMyOIDs[j]) {
 					continue
 				}
 				ctr := getByIfIndexInt(ifIdx, miscMyOIDs[j])
@@ -1164,7 +1190,9 @@ func snmpWalk(ctx context.Context, snmpdev snmpDevice) (metrics []string, walkEr
 		//log.Printf("Metrics for %s: %v\n", device, ifMetricsTotal)
 		// Detect counter resets for all interfaces
 		for _, metric := range ifMetricsTotal {
-			detectCounterReset(device, metric.ifname, metric.ifhcInOctets, metric.ifhcOutOctets)
+			if metric.hasOctets {
+				detectCounterReset(device, metric.ifname, metric.ifhcInOctets, metric.ifhcOutOctets)
+			}
 		}
 	}
 
@@ -1523,6 +1551,10 @@ func metricsHandler(w http.ResponseWriter, r *http.Request) {
 func main() {
 	flag.Parse()
 	var err error
+	requestTunings, err = parseRequestTunings(*deviceRequestTimeout, *deviceProbeTimeout, *deviceProbeRetries, *deviceMaxRepetitions)
+	if err != nil {
+		log.Fatal(err)
+	}
 	pollTimeouts, err = parsePollTimeouts(*devicePollTimeout)
 	if err != nil {
 		log.Fatal(err)
