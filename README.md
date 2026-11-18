@@ -58,6 +58,8 @@ Global flags:
 *   `-retries` — retries per request (default 2)
 *   `-max-repetitions` — GETBULK max-repetitions (default 50), lower it if the device
     drops or truncates large replies
+*   `-device-poll-timeout` — optional whole-device deadlines, for example
+    `-device-poll-timeout=192.0.2.1=30s,192.0.2.2=1m`
 
 They can be overridden per device in the config:
 
@@ -100,9 +102,45 @@ a smaller GETBULK window, and then to plain GETNEXT, and remembers what worked
 down. Set `max_repetitions` explicitly only to skip that learning phase on a
 device you already know needs it.
 
-Make sure Prometheus `scrape_timeout` for this job is larger than the worst case
-(`timeout * (1 + retries)` plus the walk time), otherwise Prometheus drops the scrape
-before the exporter is done.
+Choose a Prometheus `scrape_timeout` longer than the desired device poll budgets
+and a scrape interval longer than that timeout. A whole-device deadline includes
+the probe, retries, and all walks. Expiry discards that device's incomplete
+samples while retaining successful devices. HTTP cancellation closes outstanding
+SNMP connections, and concurrent scrapes cannot overlap polls for the same device.
+Without a device deadline, allow for `timeout * (1 + retries)` plus walk time.
+
+## Interface metadata cache
+
+Inventory caching is opt-in. Enable it for all devices with
+`-metadata-cache-ttl=10m`, or only selected devices with
+`-device-metadata-cache-ttl=192.0.2.1=10m,192.0.2.2=5m`. Per-device values
+override the global lifetime, which defaults to `0` (disabled).
+
+The cache reuses `ifDescr`, `ifName`, optional `ifAlias`, and configured
+`ifHighSpeed` values. All traffic/packet/error/discard counters, operational
+and administrative status, vendor scalars, and vendor table walks remain live
+on every poll. Existing interfaces, labels, and metric names are preserved.
+Renamed ports, edited descriptions, and speed changes may take up to one cache
+lifetime to appear. The cache is in memory and starts empty after a restart.
+
+Enabled devices fetch `sysUpTime`, `ifNumber`, and `ifTableLastChange` together
+in one GET. A decreased uptime, changed interface count/table marker, or changed
+community/version invalidates the inventory immediately. Agents that do not
+support the optional IF-MIB markers use TTL and uptime detection instead.
+When uptime cannot be verified, inventory is fetched fresh. Failed, cancelled,
+or empty reads are not cached; failed refreshes never substitute expired values.
+Counter samples are never reused as fresh measurements.
+
+This removes repeated inventory walks, but does not throttle the remaining
+counter walks or guarantee a lower peak device CPU usage. Verbose logging shows
+cache hits, row counts, and ages.
+
+Validation:
+
+```sh
+go test -race ./...
+go vet ./...
+```
 
 ## Custom tags
 

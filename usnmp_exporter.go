@@ -27,10 +27,12 @@ Example:
 package main
 
 import (
+	"context"
 	"errors"
 	"flag"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"strings"
@@ -42,7 +44,7 @@ import (
 	"gopkg.in/yaml.v2"         //
 )
 
-const appVersion = "2.3"
+const appVersion = "2.3-thgv-metadata-cache-1"
 
 var (
 	// Command-line flags
@@ -58,10 +60,15 @@ var (
 	// cost nothing on a dead device — the liveness probe in snmpWalk uses its
 	// own timeout, runs with retries disabled, and bails out first — so they only
 	// ever pay for genuine UDP packet loss on a device that is answering.
-	timeout        = flag.Int("timeout", 20, "SNMP request timeout in seconds")
-	probeTimeout   = flag.Int("probe-timeout", 10, "SNMP liveness probe timeout in seconds")
-	retries        = flag.Int("retries", 2, "SNMP request retries")
-	maxRepetitions = flag.Int("max-repetitions", 50, "GETBULK max-repetitions (lower it if the device drops large replies)")
+	timeout                = flag.Int("timeout", 20, "SNMP request timeout in seconds")
+	probeTimeout           = flag.Int("probe-timeout", 10, "SNMP liveness probe timeout in seconds")
+	retries                = flag.Int("retries", 2, "SNMP request retries")
+	maxRepetitions         = flag.Int("max-repetitions", 50, "GETBULK max-repetitions (lower it if the device drops large replies)")
+	devicePollTimeout      = flag.String("device-poll-timeout", "", "Whole-device poll limits: comma-separated IP=duration (e.g. 10.0.25.1=30s)")
+	pollTimeouts           = map[string]time.Duration{}
+	metadataCacheTTL       = flag.Duration("metadata-cache-ttl", 0, "Interface inventory cache lifetime; 0 disables caching. Counters/status are always fresh.")
+	deviceMetadataCacheTTL = flag.String("device-metadata-cache-ttl", "", "Per-device inventory cache lifetime: comma-separated IP=duration")
+	metadataCacheTTLs      = map[string]time.Duration{}
 )
 
 // internal metrics
@@ -90,7 +97,40 @@ var (
 	// which also picks up devices the operator has just upgraded.
 	walkModeCache = make(map[string]walkMode)
 	stateMu       sync.Mutex
+	activePolls   = make(map[string]bool)
 )
+
+func parsePollTimeouts(value string) (map[string]time.Duration, error) {
+	limits := make(map[string]time.Duration)
+	if value == "" {
+		return limits, nil
+	}
+	for _, entry := range strings.Split(value, ",") {
+		ip, duration, ok := strings.Cut(entry, "=")
+		limit, err := time.ParseDuration(duration)
+		if !ok || strings.TrimSpace(ip) == "" || err != nil || limit <= 0 {
+			return nil, fmt.Errorf("invalid device poll limit %q: expected IP=positive-duration", entry)
+		}
+		limits[strings.TrimSpace(ip)] = limit
+	}
+	return limits, nil
+}
+
+// Close outstanding I/O on client cancellation as well as on the poll deadline.
+// Waiting for a single request's timeout would otherwise keep abandoned polls alive.
+func connectSNMP(ctx context.Context, params *gosnmp.GoSNMP) (func(), error) {
+	params.Context = ctx
+	if err := params.Connect(); err != nil {
+		return nil, err
+	}
+	conn := params.Conn
+	return closeOnPollCancellation(ctx, conn), nil
+}
+
+func closeOnPollCancellation(ctx context.Context, conn net.Conn) func() {
+	stop := context.AfterFunc(ctx, func() { conn.Close() })
+	return func() { stop(); conn.Close() }
+}
 
 // walkMode picks how walkAllAdaptive talks to a given device.
 //
@@ -166,6 +206,9 @@ func degradeWalkMode(ip string, to walkMode, from, toName string, cause error) {
 // device. Parse errors are cheap by comparison and still retry
 // immediately.
 func walkAllAdaptive(g *gosnmp.GoSNMP, ip, oid string) ([]gosnmp.SnmpPDU, error) {
+	if g.Context != nil && g.Context.Err() != nil {
+		return nil, g.Context.Err()
+	}
 	stateMu.Lock()
 	mode := walkModeCache[ip]
 	stateMu.Unlock()
@@ -178,6 +221,9 @@ func walkAllAdaptive(g *gosnmp.GoSNMP, ip, oid string) ([]gosnmp.SnmpPDU, error)
 		rows, err := bulkWalkWithReps(g, oid, safeBulkReps)
 		if err == nil {
 			return rows, nil
+		}
+		if g.Context != nil && g.Context.Err() != nil {
+			return nil, g.Context.Err()
 		}
 		degradeWalkMode(ip, walkGetNext, "bulk-small", "getnext", err)
 		if isTimeout(err) {
@@ -193,6 +239,9 @@ func walkAllAdaptive(g *gosnmp.GoSNMP, ip, oid string) ([]gosnmp.SnmpPDU, error)
 	if err == nil {
 		return rows, nil
 	}
+	if g.Context != nil && g.Context.Err() != nil {
+		return nil, g.Context.Err()
+	}
 	if isTimeout(err) {
 		degradeWalkMode(ip, walkBulkSmall, "bulk-default", "bulk-small", err)
 		return rows, err
@@ -200,6 +249,9 @@ func walkAllAdaptive(g *gosnmp.GoSNMP, ip, oid string) ([]gosnmp.SnmpPDU, error)
 
 	// Step 2: smaller bulk window.
 	rows2, err2 := bulkWalkWithReps(g, oid, safeBulkReps)
+	if g.Context != nil && g.Context.Err() != nil {
+		return nil, g.Context.Err()
+	}
 	if err2 == nil {
 		degradeWalkMode(ip, walkBulkSmall, "bulk-default", "bulk-small", err)
 		return rows2, nil
@@ -749,7 +801,32 @@ func needBasicCounters(device string, ifaces []ifMetric, hcIn, hcOut []myOids) b
 }
 
 // func snmpWalk(device string, community string, version string, ifMisc []ifMiscOID) ([]string, error) {
-func snmpWalk(snmpdev snmpDevice) ([]string, error) {
+func snmpWalk(ctx context.Context, snmpdev snmpDevice) (metrics []string, walkErr error) {
+	if limit := pollTimeouts[snmpdev.Ip]; limit > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, limit)
+		defer cancel()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	stateMu.Lock()
+	if activePolls[snmpdev.Ip] {
+		stateMu.Unlock()
+		return nil, fmt.Errorf("device %s: a poll is already running", snmpdev.Ip)
+	}
+	activePolls[snmpdev.Ip] = true
+	stateMu.Unlock()
+	defer func() {
+		stateMu.Lock()
+		delete(activePolls, snmpdev.Ip)
+		stateMu.Unlock()
+		// A timed out device must not emit incomplete/zero-filled counters.
+		if err := ctx.Err(); err != nil {
+			metrics = nil
+			walkErr = fmt.Errorf("device %s: poll stopped: %w", snmpdev.Ip, err)
+		}
+	}()
 	device := snmpdev.Ip
 	community := snmpdev.Community
 	version := snmpdev.Version
@@ -809,11 +886,11 @@ func snmpWalk(snmpdev snmpDevice) ([]string, error) {
 	}
 
 	// connect to the snmp device
-	err := params.Connect()
+	closeSNMP, err := connectSNMP(ctx, params)
 	if err != nil {
 		return nil, fmt.Errorf("error connecting to device: %s", err)
 	}
-	defer params.Conn.Close()
+	defer closeSNMP()
 
 	// Probe: check if device is alive by querying sysObjectID (mandatory on all SNMP devices).
 	// Use a shorter, dedicated timeout so a dead host does not inherit the more
@@ -833,7 +910,27 @@ func snmpWalk(snmpdev snmpDevice) ([]string, error) {
 
 	// retrieve uptime; if unavailable, skip the minperiod check (we can't
 	// enforce a rule about uptime we don't know) but still proceed with the scrape
-	sysUpTime, upErr := getSysUpTime(params)
+	ttl := *metadataCacheTTL
+	if override, ok := metadataCacheTTLs[device]; ok {
+		ttl = override
+	}
+	var metadata *metadataPoll
+	var sysUpTime uint64
+	var upErr error
+	if ttl > 0 {
+		var identity metadataIdentity
+		identity, upErr = getMetadataIdentity(params)
+		sysUpTime = identity.uptime
+		if upErr == nil {
+			metadata = interfaceMetadata.begin(snmpdev, identity, ttl)
+		} else {
+			// An unverified uptime must not allow reuse of pre-reboot inventory.
+			interfaceMetadata.begin(snmpdev, metadataIdentity{}, 0)
+		}
+	} else {
+		sysUpTime, upErr = getSysUpTime(params)
+		interfaceMetadata.begin(snmpdev, metadataIdentity{}, 0)
+	}
 	if upErr != nil {
 		if *verbose {
 			log.Printf("Warning: Could not get sysUpTime for %s: %v — skipping minperiod check", device, upErr)
@@ -851,7 +948,7 @@ func snmpWalk(snmpdev snmpDevice) ([]string, error) {
 	}
 
 	// Use ifDescr as primary source for interface discovery (more universal, especially on Nokia SROS)
-	ifMetricsDescr, err := getIfStr(params, IfDescrOID)
+	ifMetricsDescr, err := metadata.getStr(ctx, params, IfDescrOID)
 	if err != nil {
 		return nil, fmt.Errorf("device %s: ifDescr: %s", device, err)
 	}
@@ -871,7 +968,7 @@ func snmpWalk(snmpdev snmpDevice) ([]string, error) {
 	// here turn into "no interfaces showing in the dashboard" mysteries
 	// that are impossible to diagnose without restarting the exporter
 	// with a non-default flag.
-	ifMetricsName, err := getIfStr(params, ifName)
+	ifMetricsName, err := metadata.getStr(ctx, params, ifName)
 	if err != nil {
 		log.Printf("Warning: Could not get ifName for %s (will use ifDescr): %v", device, err)
 	}
@@ -879,7 +976,7 @@ func snmpWalk(snmpdev snmpDevice) ([]string, error) {
 	// Optionally fetch ifAlias (admin-set interface description)
 	var ifMetricsAlias []myOids
 	if snmpdev.FetchIfAlias {
-		ifMetricsAlias, err = getIfStr(params, ifAlias)
+		ifMetricsAlias, err = metadata.getStr(ctx, params, ifAlias)
 		if err != nil && *verbose {
 			log.Printf("Warning: Could not get ifAlias for %s: %v", device, err)
 		}
@@ -963,7 +1060,7 @@ func snmpWalk(snmpdev snmpDevice) ([]string, error) {
 					// short-circuits on isBaselineOID so nothing is emitted.
 					continue
 				}
-				miscMyOIDs[i], err = getIfCtr(params, ifMisc[i].BaseOID)
+				miscMyOIDs[i], err = metadata.getCtr(ctx, params, ifMisc[i].BaseOID)
 				if err != nil {
 					return nil, fmt.Errorf("device %s: ifmisc %s: %s", device, ifMisc[i].Name, err)
 				}
@@ -972,6 +1069,9 @@ func snmpWalk(snmpdev snmpDevice) ([]string, error) {
 	}
 
 	// merge the metrics
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	usedBasicCounters := false
 	for i := range ifMetricsTotal {
 		ifIdx := ifMetricsTotal[i].ifIndex
@@ -1296,7 +1396,7 @@ func loadConfig(cfgFile string) ([]snmpDevice, error) {
 }
 
 // getMetricsCFG gets the metrics from the snmp devices in the config file
-func getMetricsbyCFG() ([]string, error) {
+func getMetricsbyCFG(ctx context.Context) ([]string, error) {
 	metrics := []string{}
 	// load from yaml file snmp devices
 	snmpDevices, err := loadConfig(*cfgFile)
@@ -1318,7 +1418,7 @@ func getMetricsbyCFG() ([]string, error) {
 				log.Printf("Getting metrics for %s version %s\n", dev.Ip, dev.Version)
 			}
 			start := time.Now()
-			devmetric, err := snmpWalk(dev)
+			devmetric, err := snmpWalk(ctx, dev)
 			elapsed := time.Since(start)
 			if err != nil {
 				var dde *deviceDeadError
@@ -1380,7 +1480,7 @@ func metricsHandler(w http.ResponseWriter, r *http.Request) {
 			log.Printf("Using config file %s for request %s\n", *cfgFile, r.URL)
 		}
 		// get the metrics from the snmp devices in the config file
-		metrics, err = getMetricsbyCFG()
+		metrics, err = getMetricsbyCFG(r.Context())
 		if err != nil && len(metrics) == 0 {
 			log.Printf("Error getting metrics: %s\n", err)
 			http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -1422,6 +1522,18 @@ func metricsHandler(w http.ResponseWriter, r *http.Request) {
 
 func main() {
 	flag.Parse()
+	var err error
+	pollTimeouts, err = parsePollTimeouts(*devicePollTimeout)
+	if err != nil {
+		log.Fatal(err)
+	}
+	if *metadataCacheTTL < 0 {
+		log.Fatal("metadata-cache-ttl must not be negative")
+	}
+	metadataCacheTTLs, err = parsePollTimeouts(*deviceMetadataCacheTTL)
+	if err != nil {
+		log.Fatalf("device-metadata-cache-ttl: %v", err)
+	}
 	log.Printf("Starting up usnmp_exporter v%s\n", appVersion)
 
 	// spin up the http server
